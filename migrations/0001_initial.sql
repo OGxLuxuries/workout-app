@@ -1,0 +1,18 @@
+PRAGMA foreign_keys = ON;
+CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT NOT NULL, phone TEXT UNIQUE NOT NULL, unit TEXT NOT NULL DEFAULT 'lbs', created_at TEXT NOT NULL);
+CREATE TABLE sessions (token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, expires_at TEXT NOT NULL);
+CREATE TABLE auth_challenges (id TEXT PRIMARY KEY, phone TEXT NOT NULL, name TEXT NOT NULL, invite_hash TEXT, attempts INTEGER NOT NULL DEFAULT 0, expires_at TEXT NOT NULL, consumed INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE rate_limits (key TEXT PRIMARY KEY, count INTEGER NOT NULL, expires_at TEXT NOT NULL);
+CREATE TABLE invitations (token_hash TEXT PRIMARY KEY, inviter_id TEXT REFERENCES users(id), expires_at TEXT NOT NULL, used_by TEXT REFERENCES users(id));
+CREATE TABLE sharing (a TEXT NOT NULL REFERENCES users(id), b TEXT NOT NULL REFERENCES users(id), a_consent INTEGER NOT NULL DEFAULT 0, b_consent INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(a,b), CHECK(a<>b));
+CREATE TABLE pair_codes (code_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), expires_at TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE companions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), token_hash TEXT UNIQUE NOT NULL, source_user_id TEXT NOT NULL UNIQUE, revoked INTEGER NOT NULL DEFAULT 0, last_seen TEXT);
+CREATE UNIQUE INDEX one_live_companion ON companions(user_id) WHERE revoked=0;
+CREATE TABLE weights (user_id TEXT NOT NULL REFERENCES users(id), day TEXT NOT NULL, kg REAL NOT NULL CHECK(kg>0), PRIMARY KEY(user_id,day));
+CREATE TABLE workouts (user_id TEXT NOT NULL REFERENCES users(id), source_id TEXT NOT NULL, updated_at TEXT NOT NULL, start_time TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(user_id,source_id));
+CREATE TABLE exercises (user_id TEXT NOT NULL, workout_id TEXT NOT NULL, position INTEGER NOT NULL, template_id TEXT NOT NULL, title TEXT NOT NULL, equipment TEXT, exercise_type TEXT, PRIMARY KEY(user_id,workout_id,position), FOREIGN KEY(user_id,workout_id) REFERENCES workouts(user_id,source_id) ON DELETE CASCADE);
+CREATE TABLE sets (user_id TEXT NOT NULL, workout_id TEXT NOT NULL, exercise_position INTEGER NOT NULL, position INTEGER NOT NULL, set_type TEXT NOT NULL, reps INTEGER, weight_kg REAL, PRIMARY KEY(user_id,workout_id,exercise_position,position), FOREIGN KEY(user_id,workout_id,exercise_position) REFERENCES exercises(user_id,workout_id,position) ON DELETE CASCADE);
+CREATE TABLE import_runs (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), companion_id TEXT REFERENCES companions(id), status TEXT NOT NULL, scope_start TEXT NOT NULL, scope_end TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT, page_count INTEGER, counts TEXT, message TEXT);
+CREATE UNIQUE INDEX one_active_import ON import_runs(user_id) WHERE status IN ('queued','running');
+CREATE TABLE import_pages (run_id TEXT NOT NULL REFERENCES import_runs(id) ON DELETE CASCADE, page INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(run_id,page));
+CREATE TABLE competitions (id TEXT PRIMARY KEY, a TEXT NOT NULL REFERENCES users(id), b TEXT NOT NULL REFERENCES users(id), start_day TEXT NOT NULL, choices TEXT NOT NULL, a_approved INTEGER NOT NULL DEFAULT 0, b_approved INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);

@@ -1,0 +1,40 @@
+{
+  "name": "workout-competition",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k -n web,api \"vite --host 127.0.0.1\" \"wrangler dev --ip 127.0.0.1 --port 8787\"",
+    "build": "tsc --noEmit && vite build",
+    "db:migrate": "wrangler d1 migrations apply workout-competition --local",
+    "test": "vitest run",
+    "companion": "tsx companion/main.ts",
+    "probe": "tsx companion/probe.ts",
+    "format": "prettier --write src server shared companion tests scripts",
+    "check:browser": "node scripts/browser-check.mjs",
+    "check:live": "node scripts/live-check.mjs"
+  },
+  "dependencies": {
+    "hono": "^4.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "recharts": "^3.0.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "latest",
+    "@playwright/test": "latest",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "latest",
+    "concurrently": "^9.0.0",
+    "miniflare": "^5.20261113.0-beta",
+    "prettier": "^3.10.1",
+    "tsx": "^4.0.0",
+    "typescript": "^5.9.0",
+    "vite": "latest",
+    "vitest": "latest",
+    "wrangler": "latest"
+  }
+}

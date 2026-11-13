@@ -1,0 +1,1 @@
+ALTER TABLE sessions ADD COLUMN auth_mode TEXT NOT NULL DEFAULT 'test';

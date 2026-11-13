@@ -1,0 +1,1 @@
+ALTER TABLE import_runs ADD COLUMN mode TEXT NOT NULL DEFAULT 'full';
