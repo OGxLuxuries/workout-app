@@ -606,6 +606,7 @@ describe("account and sync flow with real local D1", () => {
         if (address === "https://www.googleapis.com/oauth2/v3/certs")
           return Response.json({ keys: [jwk] });
         if (address === "https://oauth2.googleapis.com/token") {
+          expect(init?.redirect).toBe("manual");
           expect(
             (init?.body as URLSearchParams).get("code_verifier"),
           ).toHaveLength(72);
@@ -637,7 +638,7 @@ describe("account and sync flow with real local D1", () => {
       attempt: Awaited<ReturnType<typeof init>>,
       email: string,
       subject: string,
-      verified = true,
+      verified: boolean | "true" = true,
       audience = google.GOOGLE_CLIENT_ID,
     ) {
       nextToken = await new SignJWT({
@@ -687,7 +688,12 @@ describe("account and sync flow with real local D1", () => {
         false,
       );
       expect(unverified.headers.get("location")).toBe("/?signin=verification");
-      const signed = await finish(attempt, "OLIVER@example.com", "oliver-id");
+      const signed = await finish(
+        attempt,
+        "OLIVER@example.com",
+        "oliver-id",
+        "true",
+      );
       expect(signed.headers.get("location")).toBe("/");
       const session = signed.headers
         .getSetCookie()

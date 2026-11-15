@@ -45,7 +45,8 @@ export async function verifyGoogleSignIn(options: {
 }) {
   const response = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
-    redirect: "error",
+    // Workers supports manual redirects. The status check below rejects 3xx.
+    redirect: "manual",
     body: new URLSearchParams({
       grant_type: "authorization_code",
       code: options.code,
@@ -74,7 +75,7 @@ export async function verifyGoogleSignIn(options: {
     !payload.sub ||
     payload.sub.length > 255 ||
     typeof payload.email !== "string" ||
-    payload.email_verified !== true
+    (payload.email_verified !== true && payload.email_verified !== "true")
   )
     throw new Error("Google account verification failed.");
   return { subject: payload.sub, email: payload.email.trim().toLowerCase() };
