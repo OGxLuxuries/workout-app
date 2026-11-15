@@ -5,6 +5,7 @@ import {
   weekly,
   progress,
   covered,
+  rankPlayers,
 } from "../shared/scoring";
 import { validatePage, compareVersion, type Workout } from "../shared/import";
 export const workout = (
@@ -30,6 +31,28 @@ export const workout = (
 const choices = [{ id: "bench", equipment: "barbell", type: "weight_reps" }];
 const ranges = [{ start: "2026-10-01T00:00:00Z", end: "2026-11-13T00:00:00Z" }];
 describe("scoring", () => {
+  it("ranks all four players and ties scores at display precision", () => {
+    const players = [
+      { name: "Oliver", last: { improvement: 8 } },
+      { name: "Tashi", last: { improvement: 12.501 } },
+      { name: "Jason", last: { improvement: 12.504 } },
+      { name: "Blake", last: { improvement: -1 } },
+    ];
+    expect(
+      rankPlayers(players)?.map(({ player, rank }) => [player.name, rank]),
+    ).toEqual([
+      ["Tashi", 1],
+      ["Jason", 1],
+      ["Oliver", 3],
+      ["Blake", 4],
+    ]);
+    expect(
+      rankPlayers([
+        ...players.slice(0, 3),
+        { name: "Blake", last: { improvement: null } },
+      ]),
+    ).toBeNull();
+  });
   it("shows provisional progress only through the latest successful import", () => {
     const result = progress(
       [workout(), workout("w2", "2026-11-02T16:00:00Z", 150)],

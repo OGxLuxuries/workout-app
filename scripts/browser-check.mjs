@@ -22,10 +22,36 @@ try {
     await page.getByRole("button", { name: tab, exact: true }).click();
     await expect(page.locator(".page-heading h1")).toBeVisible();
   }
-  await page
-    .getByRole("button", { name: "Create private invitation", exact: true })
-    .click();
-  const url = await page.getByLabel("Invitation link").inputValue();
+  const origin = "http://localhost:5173";
+  const playerToInvite = page.getByLabel("Player to invite");
+  const inviteButton = page.getByRole("button", {
+    name: "Create private invitation",
+    exact: true,
+  });
+  for (const player of ["Tashi", "Jason"]) {
+    if (
+      !(await playerToInvite.locator("option").allTextContents()).includes(
+        player,
+      )
+    )
+      continue;
+    await playerToInvite.selectOption(player);
+    await inviteButton.click();
+    await expect(page.getByLabel("Invitation link")).toHaveValue(
+      new RegExp(`player=${player}$`),
+    );
+  }
+  let url = origin;
+  if (
+    (await playerToInvite.locator("option").allTextContents()).includes("Blake")
+  ) {
+    await playerToInvite.selectOption("Blake");
+    await inviteButton.click();
+    await expect(page.getByLabel("Invitation link")).toHaveValue(
+      /player=Blake$/,
+    );
+    url = await page.getByLabel("Invitation link").inputValue();
+  }
   const second = await browser.newContext();
   const b = await second.newPage();
   await b.goto(url);
@@ -37,23 +63,25 @@ try {
   await b.getByRole("heading", { name: /Keep moving/ }).waitFor();
   await b.getByRole("button", { name: "Settings", exact: true }).click();
   const consent = b.getByRole("button", {
-    name: "I agree to share",
-    exact: true,
+    name: /^Share with Oliver/,
   });
   if (await consent.count()) await consent.click();
   await page.reload();
   await page.getByRole("button", { name: "Settings", exact: true }).click();
-  await page
-    .getByRole("button", { name: "I agree to share", exact: true })
-    .click();
+  await page.getByRole("button", { name: /^Share with Blake/ }).click();
   await b.reload();
   await b.getByRole("button", { name: "Workouts", exact: true }).click();
   await expect(b.getByLabel("Participant").locator("option")).toHaveCount(2);
-  await page.getByRole("button", { name: "Stop sharing", exact: true }).click();
+  await page.getByRole("button", { name: /^Stop sharing with Blake/ }).click();
   await b.reload();
   await b.getByRole("button", { name: "Workouts", exact: true }).click();
   await expect(b.getByLabel("Participant").locator("option")).toHaveCount(1);
   await page.getByRole("button", { name: "Overview", exact: true }).click();
+  for (const player of ["Oliver", "Tashi", "Jason", "Blake"]) {
+    await expect(
+      page.locator(".circle-row").getByText(player, { exact: true }),
+    ).toBeVisible();
+  }
   await page.setViewportSize({ width: 390, height: 844 });
   await page.screenshot({
     path: ".local/dashboard-mobile.png",
@@ -65,7 +93,7 @@ try {
     throw new Error("Mobile overflow");
   if (errors.length) throw new Error(errors.join(";"));
   console.log(
-    "Two-session invitation, consent, revocation, navigation and mobile layout checks passed.",
+    "Four-player roster, named invitations, pairwise consent and mobile layout checks passed.",
   );
 } finally {
   await browser.close();

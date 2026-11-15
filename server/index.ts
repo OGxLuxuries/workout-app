@@ -3,12 +3,18 @@ import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import { HTTPException } from "hono/http-exception";
 import { z } from "zod";
 import {
+  googleAuthorizationUrl,
+  googleCallback,
+  verifyGoogleSignIn,
+} from "./google";
+import {
   canonical,
   compareVersion,
   validatePage,
   type Workout,
   type ImportPage,
 } from "../shared/import";
+import { allTimeStart } from "../shared/sync";
 import {
   addDays,
   dayStart,
@@ -22,12 +28,31 @@ type Env = {
   DB: D1Database;
   APP_ORIGIN: string;
   DEV_AUTH: string;
+  AUTH_PROVIDER?: "google";
+  GOOGLE_CLIENT_ID?: string;
+  GOOGLE_CLIENT_SECRET?: string;
+  OLIVER_GOOGLE_EMAIL?: string;
   BOOTSTRAP_INVITE?: string;
   TWILIO_ACCOUNT_SID?: string;
   TWILIO_AUTH_TOKEN?: string;
   TWILIO_VERIFY_SERVICE_SID?: string;
 };
-type User = { id: string; name: string; phone: string; unit: string };
+type User = { id: string; name: string; login_key: string; unit: string };
+type PlayerSlot = { name: string; user_id: string | null };
+type Sharing = {
+  a: string;
+  b: string;
+  a_consent: number;
+  b_consent: number;
+  partner_id: string;
+  partner_name: string;
+};
+type Competition = {
+  id: string;
+  start_day: string;
+  choices: ExerciseChoice[];
+  members: { id: string; name: string; approved: boolean }[];
+};
 type Companion = { id: string; user_id: string; source_user_id: string };
 type Run = {
   id: string;
@@ -84,7 +109,17 @@ const realSms = (e: Env) =>
     e.TWILIO_AUTH_TOKEN &&
     e.TWILIO_VERIFY_SERVICE_SID
   );
+const googleMode = (c: Context<AppEnv>) => c.env.AUTH_PROVIDER === "google";
+const googleReady = (c: Context<AppEnv>) =>
+  googleMode(c) &&
+  !!(
+    c.env.GOOGLE_CLIENT_ID &&
+    c.env.GOOGLE_CLIENT_SECRET &&
+    c.env.OLIVER_GOOGLE_EMAIL
+  );
+const normalizeEmail = (s: string) => s.trim().toLowerCase();
 const devMode = (c: Context<AppEnv>) =>
+  !googleMode(c) &&
   c.env.DEV_AUTH === "true" &&
   ["localhost", "127.0.0.1"].includes(new URL(c.env.APP_ORIGIN).hostname) &&
   ["localhost", "127.0.0.1"].includes(new URL(c.req.url).hostname);
@@ -105,6 +140,7 @@ app.onError((e, c) =>
 app.use("/api/*", async (c, next) => {
   c.header("Cache-Control", "no-store");
   c.header("X-Content-Type-Options", "nosniff");
+  c.header("Referrer-Policy", "no-referrer");
   if (["POST", "PUT", "DELETE", "PATCH"].includes(c.req.method)) {
     const origin = c.req.header("Origin");
     if (origin && origin !== c.env.APP_ORIGIN)
@@ -162,9 +198,184 @@ async function sms(
   return (await r.json()) as { status: string };
 }
 app.get("/api/config", (c) =>
-  c.json({ devAuth: devMode(c), smsReady: realSms(c.env) }),
+  c.json({
+    devAuth: devMode(c),
+    smsReady: !googleMode(c) && realSms(c.env),
+    googleAuth: googleMode(c),
+    googleReady: googleReady(c),
+  }),
 );
+async function startSession(
+  c: Context<AppEnv>,
+  userId: string,
+  mode: "google" | "test" | "sms",
+) {
+  const session = token();
+  await db(c)
+    .prepare(
+      "INSERT INTO sessions(token_hash,user_id,expires_at,auth_mode) VALUES(?,?,?,?)",
+    )
+    .bind(await hash(session), userId, after(30 * 86400000), mode)
+    .run();
+  setCookie(c, "wc_session", session, {
+    httpOnly: true,
+    sameSite: mode === "google" ? "Lax" : "Strict",
+    secure: c.env.APP_ORIGIN.startsWith("https:"),
+    path: "/",
+    maxAge: 30 * 86400,
+  });
+}
+
+app.post("/api/auth/google/start", async (c) => {
+  if (!googleReady(c)) fail("Google sign-in is not configured.", 503);
+  const { invite } = z
+    .object({ invite: z.string().max(100).optional() })
+    .parse(await c.req.json());
+  await rate(
+    c,
+    "google-start:" + (await hash(c.req.header("CF-Connecting-IP") || "local")),
+    20,
+    600000,
+  );
+  const state = token(),
+    browser = token(),
+    nonce = token(),
+    verifier = token();
+  await db(c).batch([
+    db(c)
+      .prepare("DELETE FROM google_sign_ins WHERE expires_at<=?")
+      .bind(now()),
+    db(c)
+      .prepare("INSERT INTO google_sign_ins VALUES(?,?,?,?,?,?)")
+      .bind(
+        await hash(state),
+        await hash(browser),
+        verifier,
+        nonce,
+        invite ? await hash(invite) : null,
+        after(600000),
+      ),
+  ]);
+  setCookie(c, "wc_google", browser, {
+    path: googleCallback,
+    httpOnly: true,
+    secure: c.env.APP_ORIGIN.startsWith("https:"),
+    sameSite: "Lax",
+    maxAge: 600,
+  });
+  return c.json({
+    url: await googleAuthorizationUrl({
+      clientId: c.env.GOOGLE_CLIENT_ID!,
+      origin: c.env.APP_ORIGIN,
+      state,
+      nonce,
+      verifier,
+    }),
+  });
+});
+
+async function enrollWithGoogle(
+  c: Context<AppEnv>,
+  loginKey: string,
+  email: string,
+  inviteHash: string | null,
+) {
+  const isOliver = normalizeEmail(c.env.OLIVER_GOOGLE_EMAIL!) === email;
+  if (!isOliver && !inviteHash) return null;
+  const criteria = isOliver
+    ? "p.name='Oliver'"
+    : `p.name<>'Oliver' AND EXISTS (
+    SELECT 1 FROM invitations i WHERE i.player_name=p.name AND i.token_hash=?
+    AND i.google_email=? AND i.used_by IS NULL AND i.expires_at>?)`;
+  const eligible = `SELECT p.name,p.user_id FROM player_slots p LEFT JOIN users u ON u.id=p.user_id
+    WHERE (p.user_id IS NULL OR u.login_key='pending:'||u.id) AND ${criteria}`;
+  const invitationArgs = isOliver ? [] : [inviteHash, email, now()];
+  const slot = await one<PlayerSlot>(c, eligible, ...invitationArgs);
+  if (!slot) return null;
+  const id = slot.user_id ?? crypto.randomUUID();
+  await db(c).batch([
+    db(c)
+      .prepare(
+        `UPDATE users SET login_key=? WHERE id=? AND id=(SELECT user_id FROM (${eligible}))`,
+      )
+      .bind(loginKey, id, ...invitationArgs),
+    db(c)
+      .prepare(
+        `INSERT INTO users(id,name,login_key,created_at) SELECT ?,name,?,? FROM (${eligible}) WHERE user_id IS NULL`,
+      )
+      .bind(id, loginKey, now(), ...invitationArgs),
+    db(c)
+      .prepare(
+        "UPDATE player_slots SET user_id=? WHERE name=? AND user_id IS NULL AND EXISTS(SELECT 1 FROM users WHERE id=? AND login_key=?)",
+      )
+      .bind(id, slot.name, id, loginKey),
+    db(c)
+      .prepare(
+        "UPDATE invitations SET used_by=? WHERE player_name=? AND used_by IS NULL AND EXISTS(SELECT 1 FROM users WHERE id=? AND login_key=?)",
+      )
+      .bind(id, slot.name, id, loginKey),
+    db(c)
+      .prepare(
+        `INSERT INTO sharing(a,b) SELECT u.id,? FROM users u WHERE u.id<>?
+      AND EXISTS(SELECT 1 FROM users WHERE id=? AND login_key=?)
+      AND NOT EXISTS(SELECT 1 FROM sharing s WHERE (s.a=u.id AND s.b=?) OR (s.a=? AND s.b=u.id))`,
+      )
+      .bind(id, id, id, loginKey, id, id),
+  ]);
+  return one<User>(
+    c,
+    "SELECT * FROM users WHERE id=? AND login_key=?",
+    id,
+    loginKey,
+  );
+}
+
+app.get(googleCallback, async (c) => {
+  const back = (error?: string) =>
+    c.redirect(error ? `/?signin=${error}` : "/", 303);
+  if (!googleReady(c)) return back("unavailable");
+  const state = c.req.query("state"),
+    browser = getCookie(c, "wc_google");
+  if (!state || state.length > 100 || !browser || browser.length > 100)
+    return back("expired");
+  const attempt = await db(c)
+    .prepare(
+      `DELETE FROM google_sign_ins WHERE state_hash=? AND browser_hash=? AND expires_at>?
+    RETURNING verifier, nonce, invite_hash`,
+    )
+    .bind(await hash(state), await hash(browser), now())
+    .first<{ verifier: string; nonce: string; invite_hash: string | null }>();
+  if (!attempt) return back("expired");
+  deleteCookie(c, "wc_google", { path: googleCallback });
+  const code = c.req.query("code");
+  if (!code || code.length > 4096 || c.req.query("error"))
+    return back("canceled");
+  let identity: Awaited<ReturnType<typeof verifyGoogleSignIn>>;
+  try {
+    identity = await verifyGoogleSignIn({
+      clientId: c.env.GOOGLE_CLIENT_ID!,
+      clientSecret: c.env.GOOGLE_CLIENT_SECRET!,
+      origin: c.env.APP_ORIGIN,
+      code,
+      verifier: attempt.verifier,
+      nonce: attempt.nonce,
+    });
+  } catch {
+    return back("verification");
+  }
+  const loginKey = "google:" + identity.subject;
+  const user =
+    (await one<User>(c, "SELECT * FROM users WHERE login_key=?", loginKey)) ??
+    (await enrollWithGoogle(c, loginKey, identity.email, attempt.invite_hash));
+  if (!user) return back("invitation");
+  await startSession(c, user.id, "google");
+  return back();
+});
+
+const openInvitation = `SELECT i.* FROM invitations i JOIN player_slots p ON p.name=i.player_name
+  WHERE i.token_hash=? AND i.used_by IS NULL AND i.expires_at>? AND p.user_id IS NULL`;
 app.post("/api/auth/start", async (c) => {
+  if (googleMode(c)) fail("Use Sign in with Google.", 404);
   const input = z
     .object({
       phone: z.string().regex(/^\+[1-9]\d{7,14}$/),
@@ -174,7 +385,7 @@ app.post("/api/auth/start", async (c) => {
     .parse(await c.req.json());
   const existing = await one<User>(
     c,
-    "SELECT * FROM users WHERE phone=?",
+    "SELECT * FROM users WHERE login_key=?",
     input.phone,
   );
   let inviteHash: string | null = null;
@@ -189,17 +400,17 @@ app.post("/api/auth/start", async (c) => {
     )
       await db(c)
         .prepare(
-          "INSERT OR IGNORE INTO invitations(token_hash,expires_at) VALUES(?,?)",
+          `INSERT INTO invitations(token_hash,expires_at,player_name) VALUES(?,?,'Oliver')
+           ON CONFLICT(token_hash) DO UPDATE SET player_name='Oliver',expires_at=excluded.expires_at
+           WHERE invitations.inviter_id IS NULL AND invitations.used_by IS NULL`,
         )
         .bind(inviteHash, after(86400000))
         .run();
-    const invite = await one(
-      c,
-      "SELECT * FROM invitations WHERE token_hash=? AND used_by IS NULL AND expires_at>?",
-      inviteHash,
-      now(),
-    );
-    if (!invite) fail("This invitation is invalid or expired.");
+    const invite = await one(c, openInvitation, inviteHash, now());
+    if (!invite)
+      fail(
+        "This invitation is invalid, expired, or the player has already joined.",
+      );
   }
   if (!devMode(c) && !realSms(c.env))
     fail("SMS login needs Twilio Verify configuration on the server.", 503);
@@ -217,6 +428,7 @@ app.post("/api/auth/start", async (c) => {
   return c.json({ challenge: id, devAuth: devMode(c) });
 });
 app.post("/api/auth/verify", async (c) => {
+  if (googleMode(c)) fail("Use Sign in with Google.", 404);
   const input = z
     .object({ challenge: z.string(), code: z.string().regex(/^\d{6}$/) })
     .parse(await c.req.json());
@@ -250,59 +462,39 @@ app.post("/api/auth/verify", async (c) => {
     .bind(challengeHash)
     .first();
   if (!consumed) fail("This code has already been used.", 409);
-  let user = await one<User>(c, "SELECT * FROM users WHERE phone=?", ch.phone);
+  let user = await one<User>(
+    c,
+    "SELECT * FROM users WHERE login_key=?",
+    ch.phone,
+  );
   if (!user) {
-    const invitation = await one<any>(
-      c,
-      "SELECT * FROM invitations WHERE token_hash=? AND used_by IS NULL AND expires_at>?",
-      ch.invite_hash,
-      now(),
-    );
-    if (!invitation) fail("Invitation is no longer valid.", 409);
     const id = crypto.randomUUID();
     await db(c).batch([
       db(c)
         .prepare(
-          "INSERT INTO users(id,name,phone,created_at) SELECT ?,?,?,? WHERE EXISTS(SELECT 1 FROM invitations WHERE token_hash=? AND used_by IS NULL AND expires_at>?)",
+          `INSERT INTO users(id,name,login_key,created_at) SELECT ?,i.player_name,?,? FROM (${openInvitation}) i`,
         )
-        .bind(id, ch.name, ch.phone, now(), ch.invite_hash, now()),
+        .bind(id, ch.phone, now(), ch.invite_hash, now()),
+      db(c)
+        .prepare(
+          "UPDATE player_slots SET user_id=? WHERE name=(SELECT player_name FROM invitations WHERE token_hash=?) AND EXISTS(SELECT 1 FROM users WHERE id=?)",
+        )
+        .bind(id, ch.invite_hash, id),
       db(c)
         .prepare(
           "UPDATE invitations SET used_by=? WHERE token_hash=? AND used_by IS NULL AND EXISTS(SELECT 1 FROM users WHERE id=?)",
         )
         .bind(id, ch.invite_hash, id),
-      ...(invitation.inviter_id
-        ? [
-            db(c)
-              .prepare(
-                "INSERT OR IGNORE INTO sharing(a,b) SELECT ?,? WHERE EXISTS(SELECT 1 FROM users WHERE id=?)",
-              )
-              .bind(invitation.inviter_id, id, id),
-          ]
-        : []),
+      db(c)
+        .prepare(
+          "INSERT INTO sharing(a,b) SELECT id,? FROM users WHERE id<>? AND EXISTS(SELECT 1 FROM users WHERE id=?)",
+        )
+        .bind(id, id, id),
     ]);
     user = await one<User>(c, "SELECT * FROM users WHERE id=?", id);
     if (!user) fail("Invitation has already been used.", 409);
   }
-  const session = token();
-  await db(c)
-    .prepare(
-      "INSERT INTO sessions(token_hash,user_id,expires_at,auth_mode) VALUES(?,?,?,?)",
-    )
-    .bind(
-      await hash(session),
-      user.id,
-      after(30 * 86400000),
-      devMode(c) ? "test" : "sms",
-    )
-    .run();
-  setCookie(c, "wc_session", session, {
-    httpOnly: true,
-    sameSite: "Strict",
-    secure: c.env.APP_ORIGIN.startsWith("https:"),
-    path: "/",
-    maxAge: 30 * 86400,
-  });
+  await startSession(c, user.id, devMode(c) ? "test" : "sms");
   return c.json({ ok: true });
 });
 app.use("/api/app/*", async (c, next) => {
@@ -310,10 +502,10 @@ app.use("/api/app/*", async (c, next) => {
   if (!session) fail("Please sign in.", 401);
   const user = await one<User>(
     c,
-    "SELECT u.* FROM users u JOIN sessions s ON s.user_id=u.id WHERE s.token_hash=? AND s.expires_at>? AND (s.auth_mode='sms' OR ?=1)",
+    "SELECT u.* FROM users u JOIN sessions s ON s.user_id=u.id WHERE s.token_hash=? AND s.expires_at>? AND s.auth_mode=?",
     await hash(session),
     now(),
-    devMode(c) ? 1 : 0,
+    googleMode(c) ? "google" : devMode(c) ? "test" : "sms",
   );
   if (!user) fail("Your session has expired. Please sign in.", 401);
   c.set("user", user);
@@ -328,12 +520,63 @@ app.post("/api/app/logout", async (c) => {
   return c.json({ ok: true });
 });
 app.post("/api/app/invite", async (c) => {
+  const { playerName, googleEmail } = z
+    .object({
+      playerName: z.string(),
+      googleEmail: z.string().trim().max(254).pipe(z.email()).optional(),
+    })
+    .parse(await c.req.json());
+  const userId = c.get("user").id;
+  if (googleMode(c)) {
+    const organizer = await one(
+      c,
+      "SELECT name FROM player_slots WHERE name='Oliver' AND user_id=?",
+      userId,
+    );
+    if (!organizer) fail("Oliver manages invitations for the roster.", 403);
+    if (
+      !googleEmail ||
+      normalizeEmail(googleEmail) ===
+        normalizeEmail(c.env.OLIVER_GOOGLE_EMAIL!) ||
+      playerName === "Oliver"
+    )
+      fail("Enter the Google email for the invited player.");
+  }
   const raw = token();
-  await db(c)
-    .prepare("INSERT INTO invitations VALUES(?,?,?,NULL)")
-    .bind(await hash(raw), c.get("user").id, after(7 * 86400000))
-    .run();
-  return c.json({ url: c.env.APP_ORIGIN + "/?invite=" + raw });
+  const inviteHash = await hash(raw);
+  const email = googleMode(c) ? normalizeEmail(googleEmail!) : null;
+  const [created] = await db(c).batch([
+    db(c)
+      .prepare(
+        `INSERT INTO invitations(token_hash,inviter_id,expires_at,player_name,google_email)
+      SELECT ?,?,?,p.name,? FROM player_slots p LEFT JOIN users u ON u.id=p.user_id
+      WHERE p.name=? AND (p.user_id IS NULL OR (?=1 AND u.login_key='pending:'||u.id))`,
+      )
+      .bind(
+        inviteHash,
+        userId,
+        after(7 * 86400000),
+        email,
+        playerName,
+        Number(googleMode(c)),
+      ),
+    db(c)
+      .prepare(
+        `DELETE FROM invitations WHERE player_name=? AND used_by IS NULL AND token_hash<>?
+      AND EXISTS(SELECT 1 FROM invitations WHERE token_hash=?) AND ?=1`,
+      )
+      .bind(playerName, inviteHash, inviteHash, Number(googleMode(c))),
+  ]);
+  if (!created.meta.changes)
+    fail("That player is already enrolled or is outside the roster.", 409);
+  return c.json({
+    url:
+      c.env.APP_ORIGIN +
+      "/?invite=" +
+      raw +
+      "&player=" +
+      encodeURIComponent(playerName),
+  });
 });
 app.post("/api/app/sharing", async (c) => {
   const { partnerId, consent } = z
@@ -442,23 +685,26 @@ app.post("/api/app/sync", async (c) => {
   if (!companion) fail("Pair your local Codex companion first.", 409);
   if (
     !companion.last_seen ||
-    Date.parse(companion.last_seen) < Date.now() - 60000
+    Date.parse(companion.last_seen) < Date.now() - 90000
   )
     fail(
       "Your companion is offline. Start it on your computer, then retry.",
       409,
     );
-  const last = await one<any>(
+  const last = await one<{ scope_end: string }>(
     c,
-    "SELECT scope_end FROM import_runs WHERE user_id=? AND status='completed' AND mode='full' ORDER BY scope_end DESC LIMIT 1",
+    `SELECT scope_end FROM import_runs WHERE user_id=? AND status='completed' AND mode='full'
+     AND EXISTS (SELECT 1 FROM import_runs WHERE user_id=? AND status='completed' AND mode='full' AND scope_start=?)
+     ORDER BY scope_end DESC LIMIT 1`,
     user.id,
+    user.id,
+    allTimeStart,
   );
   const end = now(),
-    start = new Date(
-      last
-        ? Date.parse(last.scope_end) - 7 * 86400000
-        : Date.now() - 90 * 86400000,
-    ).toISOString(),
+    start =
+      last && mode === "full"
+        ? new Date(Date.parse(last.scope_end) - 7 * 86400000).toISOString()
+        : allTimeStart,
     id = crypto.randomUUID();
   await db(c)
     .prepare(
@@ -474,22 +720,39 @@ app.post("/api/app/sync", async (c) => {
     ),
   );
 });
-async function relation(c: Context<AppEnv>, partner: string) {
-  const id = c.get("user").id;
-  return one<any>(
+function roster(c: Context<AppEnv>) {
+  return rows<PlayerSlot>(
     c,
-    "SELECT * FROM sharing WHERE ((a=? AND b=?) OR (a=? AND b=?)) AND a_consent=1 AND b_consent=1",
+    `SELECT p.name,CASE WHEN ?=1 AND u.login_key NOT LIKE 'google:%' THEN NULL ELSE p.user_id END user_id
+     FROM player_slots p LEFT JOIN users u ON u.id=p.user_id ORDER BY p.position`,
+    Number(googleMode(c)),
+  );
+}
+function playerSharing(c: Context<AppEnv>) {
+  const id = c.get("user").id;
+  return rows<Sharing>(
+    c,
+    `SELECT s.*,u.name partner_name,u.id partner_id FROM sharing s
+    JOIN users u ON u.id=CASE WHEN s.a=? THEN s.b ELSE s.a END
+    LEFT JOIN player_slots p ON p.user_id=u.id WHERE (s.a=? OR s.b=?) AND (?=0 OR u.login_key LIKE 'google:%')
+    ORDER BY p.position,u.name`,
     id,
-    partner,
-    partner,
     id,
+    id,
+    Number(googleMode(c)),
+  );
+}
+function canViewPlayers(c: Context<AppEnv>, ids: string[], sharing: Sharing[]) {
+  return ids.every(
+    (id) =>
+      id === c.get("user").id ||
+      sharing.some((s) => s.partner_id === id && s.a_consent && s.b_consent),
   );
 }
 app.post("/api/app/competition", async (c) => {
-  const { partnerId, startDay, choices } = z
+  const { startDay, choices } = z
     .object({
-      partnerId: z.string(),
-      startDay: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+      startDay: z.iso.date(),
       choices: z
         .array(
           z.object({
@@ -502,16 +765,26 @@ app.post("/api/app/competition", async (c) => {
         .max(30),
     })
     .parse(await c.req.json());
-  if (!(await relation(c, partnerId)))
-    fail("Both participants must consent to sharing.", 403);
+  const slots = await roster(c);
+  const members = slots.flatMap((p) => (p.user_id ? [p.user_id] : []));
+  const id = c.get("user").id;
+  if (members.length !== slots.length || !members.includes(id))
+    fail("All four players must join before proposing a competition.", 409);
+  if (!canViewPlayers(c, members, await playerSharing(c)))
+    fail("Set up mutual sharing with every player first.", 403);
   if (monday(startDay) !== startDay || startDay <= localDay(new Date()))
     fail("Choose a future Monday.");
-  const id = c.get("user").id;
-  const shared = await rows<any>(
+  const shared = await rows<{
+    template_id: string;
+    equipment: string;
+    exercise_type: string;
+  }>(
     c,
-    "SELECT DISTINCT template_id,equipment,exercise_type FROM exercises WHERE user_id=? AND exercise_type='weight_reps' AND equipment IS NOT NULL INTERSECT SELECT DISTINCT template_id,equipment,exercise_type FROM exercises WHERE user_id=? AND exercise_type='weight_reps' AND equipment IS NOT NULL",
-    id,
-    partnerId,
+    `SELECT template_id,equipment,exercise_type FROM exercises
+     WHERE user_id IN (${members.map(() => "?").join(",")}) AND exercise_type='weight_reps' AND equipment IS NOT NULL
+     GROUP BY template_id,equipment,exercise_type HAVING count(DISTINCT user_id)=?`,
+    ...members,
+    members.length,
   );
   if (
     choices.some(
@@ -524,53 +797,59 @@ app.post("/api/app/competition", async (c) => {
         ),
     )
   )
-    fail("Choose only resolved exercise variants present in both histories.");
-  await db(c)
-    .prepare("INSERT INTO competitions VALUES(?,?,?,?,?,1,0,?)")
-    .bind(
-      crypto.randomUUID(),
-      id,
-      partnerId,
-      startDay,
-      JSON.stringify(choices),
-      now(),
-    )
-    .run();
+    fail("Choose exercise variants present in all four workout histories.");
+  const competitionId = crypto.randomUUID();
+  await db(c).batch([
+    db(c)
+      .prepare("INSERT INTO competitions VALUES(?,?,?,?)")
+      .bind(competitionId, startDay, JSON.stringify(choices), now()),
+    ...members.map((member) =>
+      db(c)
+        .prepare("INSERT INTO competition_members VALUES(?,?,?)")
+        .bind(competitionId, member, Number(member === id)),
+    ),
+  ]);
   return c.json({ ok: true });
 });
 app.post("/api/app/competition/:id/approve", async (c) => {
   const id = c.get("user").id;
   const comp = await one<any>(
     c,
-    "SELECT * FROM competitions WHERE id=? AND (a=? OR b=?)",
+    "SELECT c.id,c.start_day FROM competitions c JOIN competition_members m ON m.competition_id=c.id WHERE c.id=? AND m.user_id=?",
     c.req.param("id"),
-    id,
     id,
   );
   if (!comp) fail("Competition not found.", 404);
   if (comp.start_day <= localDay(new Date()))
     fail("This start date has passed. Propose a new competition.", 409);
-  if (!(await relation(c, comp.a === id ? comp.b : comp.a)))
-    fail("Sharing consent is required.", 403);
+  const members = await rows<{ user_id: string }>(
+    c,
+    "SELECT user_id FROM competition_members WHERE competition_id=?",
+    comp.id,
+  );
+  if (
+    !canViewPlayers(
+      c,
+      members.map((m) => m.user_id),
+      await playerSharing(c),
+    )
+  )
+    fail(
+      "Set up mutual sharing with every player in this competition first.",
+      403,
+    );
   await db(c)
     .prepare(
-      "UPDATE competitions SET a_approved=CASE WHEN a=? THEN 1 ELSE a_approved END,b_approved=CASE WHEN b=? THEN 1 ELSE b_approved END WHERE id=?",
+      "UPDATE competition_members SET approved=1 WHERE competition_id=? AND user_id=?",
     )
-    .bind(id, id, comp.id)
+    .bind(comp.id, id)
     .run();
   return c.json({ ok: true });
 });
 app.get("/api/app/dashboard", async (c) => {
   const user = c.get("user");
   await expireRuns(c, user.id);
-  const sharing = await rows<any>(
-    c,
-    "SELECT s.*,u.name partner_name,CASE WHEN s.a=? THEN s.b ELSE s.a END partner_id FROM sharing s JOIN users u ON u.id=CASE WHEN s.a=? THEN s.b ELSE s.a END WHERE s.a=? OR s.b=?",
-    user.id,
-    user.id,
-    user.id,
-    user.id,
-  );
+  const [sharing, slots] = await Promise.all([playerSharing(c), roster(c)]);
   const ids = [
     user.id,
     ...sharing
@@ -608,29 +887,55 @@ app.get("/api/app/dashboard", async (c) => {
     );
     people.push({ ...profile, workouts, weights, ranges, imports });
   }
-  const competitions = (
-    await rows<any>(
-      c,
-      "SELECT * FROM competitions WHERE a=? OR b=? ORDER BY created_at DESC",
-      user.id,
-      user.id,
-    )
-  ).filter((co) => ids.includes(co.a) && ids.includes(co.b));
+  const competitionRows = await rows<{
+    id: string;
+    start_day: string;
+    choices: string;
+    member_id: string;
+    member_name: string;
+    approved: number;
+  }>(
+    c,
+    `
+    SELECT c.id,c.start_day,c.choices,m.user_id member_id,u.name member_name,m.approved
+    FROM competitions c JOIN competition_members m ON m.competition_id=c.id JOIN users u ON u.id=m.user_id
+    LEFT JOIN player_slots p ON p.user_id=u.id
+    WHERE EXISTS (SELECT 1 FROM competition_members mine WHERE mine.competition_id=c.id AND mine.user_id=?)
+    ORDER BY c.created_at DESC,c.id,p.position,u.name`,
+    user.id,
+  );
+  const competitionsById = new Map<string, Competition>();
+  for (const row of competitionRows) {
+    const competition: Competition = competitionsById.get(row.id) ?? {
+      id: row.id,
+      start_day: row.start_day,
+      choices: JSON.parse(row.choices),
+      members: [],
+    };
+    competition.members.push({
+      id: row.member_id,
+      name: row.member_name,
+      approved: !!row.approved,
+    });
+    competitionsById.set(row.id, competition);
+  }
+  const competitions = [...competitionsById.values()].filter((co) =>
+    co.members.every((member) => ids.includes(member.id)),
+  );
   const week = monday(localDay(new Date()));
   const results = competitions
-    .filter((co) => co.a_approved && co.b_approved)
+    .filter((co) => co.members.every((m) => m.approved))
     .map((co) => ({
       ...co,
-      choices: JSON.parse(co.choices),
-      results: people
-        .filter((p) => p.id === co.a || p.id === co.b)
+      results: co.members
+        .map((member) => people.find((p) => p.id === member.id)!)
         .map((p) => ({
           userId: p.id,
           name: p.name,
           current: progress(
             p.workouts,
             p.weights,
-            JSON.parse(co.choices),
+            co.choices,
             co.start_day,
             week,
             p.ranges,
@@ -638,7 +943,7 @@ app.get("/api/app/dashboard", async (c) => {
           last: progress(
             p.workouts,
             p.weights,
-            JSON.parse(co.choices),
+            co.choices,
             co.start_day,
             addDays(week, -7),
             p.ranges,
@@ -648,6 +953,7 @@ app.get("/api/app/dashboard", async (c) => {
   return c.json({
     me: { id: user.id, name: user.name, unit: user.unit },
     sharing,
+    roster: slots,
     people,
     competitions,
     results,
@@ -689,7 +995,8 @@ app.post("/api/companion/pair", async (c) => {
   );
   const priorData = await one<any>(
     c,
-    "SELECT id FROM import_runs WHERE user_id=? LIMIT 1",
+    "SELECT 1 FROM workouts WHERE user_id=? UNION ALL SELECT 1 FROM import_runs WHERE user_id=? LIMIT 1",
+    pair.user_id,
     pair.user_id,
   );
   if (priorSource && priorSource.source_user_id !== sourceUserId && priorData)
@@ -869,8 +1176,9 @@ app.post("/api/companion/jobs/:id/complete", async (c) => {
     .filter(
       (w) =>
         (run as any).mode === "probe" ||
-        (Date.parse(w.start_time) >= Date.parse(run.scope_start) &&
-          Date.parse(w.start_time) < Date.parse(run.scope_end)),
+        (Date.parse(w.start_time) < Date.parse(run.scope_end) &&
+          Math.max(Date.parse(w.start_time), Date.parse(w.updated_at)) >=
+            Date.parse(run.scope_start)),
     );
   const existing = new Map(
     (

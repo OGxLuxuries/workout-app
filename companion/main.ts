@@ -166,7 +166,7 @@ try {
       } catch (e) {
         console.error((e as Error).message);
       }
-      await delay(5000);
+      await delay(new URL(config.url).protocol === "https:" ? 25000 : 5000);
     }
   }
 } catch (e) {

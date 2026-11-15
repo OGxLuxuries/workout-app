@@ -1,13 +1,13 @@
 # Workout App — design.md
 
-> Implementation note: the proof of concept uses a dashboard button and a paired local Codex companion. See README.md for the current workflow. Dashboard plugin OAuth and scheduling are deferred.
+> Current implementation: Cloudflare Workers and D1 host a four-player dashboard with invitation-only Google sign-in. A dashboard button starts a sync through each player's local Codex companion. The first full sync covers the player's entire Hevy history. See README.md for setup. The proposed dashboard plugin and scheduling below are future work.
 
 ## Summary
 Create `C:\Users\odgj6\workout-app\design.md` describing the agreed first version. The directory currently exists and is empty. This document defines product behavior and integrations; framework, hosting, database vendor, and authentication provider remain outside its scope.
 
 ## Product design
-- A private web dashboard for two people, each with their own account and connected Hevy account in ChatGPT.
-- One person invites the other; both explicitly consent to sharing workout details: exercises, sets, reps, weights, dates, and progress. Personal notes and descriptions are excluded from imports.
+- A private web dashboard for Oliver, Tashi, Jason, and Blake, each with their own account and connected Hevy account.
+- Each player joins through a named invitation. Both players in a pair explicitly consent before sharing workout details. All four approve a group competition and its common exercises.
 - Show individual workout history and side-by-side progress for matching exercises: weight and reps over time, workout frequency, and changes from each person’s baseline.
 - Preserve exercise identities and distinguish equipment and exercise variants. Store weights in kilograms and display preferred units.
 - Show each person’s latest successful import and covered date range independently. Previously imported data remains viewable when their computer is offline.
@@ -50,7 +50,7 @@ These are unresolved decisions or checks needed for a working proof of concept. 
 - **Budget and ownership:** Set an acceptable monthly cost = $10.
 - **Implementation stack:** (Agent Choice) web framework, backend language, MCP SDK, and charting library.
 - **Database:** (Agent Choice) and hosting location; define the minimum records for users, sharing relationships, workouts, sets, and import runs.
-- **Website login:** Just two participants: Oliver and Blake with an option for more to join later - by siging up with name and phone number.
+- **Website login:** Four invite-only slots for Oliver, Tashi, Jason, and Blake. Each player signs in using their own phone number.
 - **Plugin OAuth:** (Agent Choice) Choose an OAuth authorization-server implementation compatible with ChatGPT. Define client registration, callback URLs, scopes, token storage, and revocation. Verify that the website’s login provider supports this role or provide a separate implementation.
 - **Private plugin distribution:** Keep it repo based: `codex plugin marketplace add YOUR-USERNAME/YOUR-REPOSITORY`
 - **Exercise matching and progress:** Users body weight is stored and updated, then volume lifted has a percent increase relative to the that users weight and that is the deciding measurement to in the competition.

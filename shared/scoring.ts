@@ -152,3 +152,23 @@ export function progress(
       : null;
   return { ...current, baseline: baseline.volume, improvement };
 }
+
+export function rankPlayers<T extends { last: { improvement: number | null } }>(
+  players: T[],
+) {
+  if (!players.length || players.some((p) => p.last.improvement === null))
+    return null;
+  const sorted = players
+    .map((player) => ({
+      player,
+      score: Number(player.last.improvement!.toFixed(2)),
+    }))
+    .sort((a, b) => b.score - a.score);
+  return sorted.map((entry, index) => ({
+    ...entry,
+    rank:
+      index > 0 && entry.score === sorted[index - 1].score
+        ? sorted.findIndex((candidate) => candidate.score === entry.score) + 1
+        : index + 1,
+  }));
+}

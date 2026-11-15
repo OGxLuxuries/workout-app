@@ -1,8 +1,9 @@
 import React, { useEffect, useState, lazy, Suspense } from "react";
 import { createRoot } from "react-dom/client";
 const ProgressChart = lazy(() => import("./ProgressChart"));
-import { localDay, monday, addDays } from "../shared/scoring";
+import { localDay, monday, addDays, rankPlayers } from "../shared/scoring";
 import type { Workout } from "../shared/import";
+import { allTimeStart } from "../shared/sync";
 import "./style.css";
 
 async function api(path: string, body?: unknown) {
@@ -31,23 +32,53 @@ const date = (v: string) =>
   });
 const percent = (v: number | null) =>
   v === null ? "—" : `${v >= 0 ? "+" : ""}${v.toFixed(2)}%`;
+type PlayerSlot = { name: string; user_id: string | null };
+type CompetitionMember = { id: string; name: string; approved: boolean };
+type PlayerScore = {
+  userId: string;
+  name: string;
+  current: { improvement: number | null };
+  last: { improvement: number | null; frequency: number; baseline: number };
+};
+type LoginConfig = {
+  devAuth: boolean;
+  smsReady: boolean;
+  googleAuth: boolean;
+  googleReady: boolean;
+};
+const signInErrors: Record<string, string> = {
+  invitation:
+    "That Google account does not have an invitation. Reopen your link and choose the account it was issued to.",
+  expired:
+    "This sign-in attempt expired. Try again from this page or your invitation link.",
+  canceled: "Google sign-in was canceled. You can try again.",
+  verification: "Google sign-in could not be verified. Try again.",
+  unavailable: "Google sign-in is being set up.",
+};
 function App() {
   const [data, setData] = useState<any>(null),
-    [config, setConfig] = useState<any>(null),
+    [config, setConfig] = useState<LoginConfig | null>(null),
     [tab, setTab] = useState("Overview"),
-    [error, setError] = useState(""),
+    [error, setError] = useState(
+      () =>
+        signInErrors[
+          new URLSearchParams(location.search).get("signin") || ""
+        ] || "",
+    ),
     [notice, setNotice] = useState(""),
     [busy, setBusy] = useState(false),
     [loading, setLoading] = useState(true);
   const [challenge, setChallenge] = useState(""),
     [login, setLogin] = useState({
-      name: "",
+      name: new URLSearchParams(location.search).get("player") || "",
       phone: "",
       code: "",
       invite: new URLSearchParams(location.search).get("invite") || "",
     });
   const [pairCode, setPairCode] = useState(""),
     [inviteUrl, setInviteUrl] = useState(""),
+    [invitePlayer, setInvitePlayer] = useState(""),
+    [inviteEmail, setInviteEmail] = useState(""),
     [selected, setSelected] = useState(""),
     [historyUser, setHistoryUser] = useState(""),
     [expanded, setExpanded] = useState("");
@@ -72,11 +103,6 @@ function App() {
       .catch((e) => setError(e.message));
     void refresh();
   }, []);
-  useEffect(() => {
-    if (!data) return;
-    const timer = setInterval(() => void refresh(), 5000);
-    return () => clearInterval(timer);
-  }, [!!data]);
   async function act(fn: () => Promise<void>) {
     setBusy(true);
     setError("");
@@ -89,8 +115,24 @@ function App() {
       setBusy(false);
     }
   }
-  const me = data?.people.find((p: any) => p.id === data.me.id),
-    partner = data?.people.find((p: any) => p.id !== data.me.id);
+  const me = data?.people.find((p: any) => p.id === data.me.id);
+  const roster: PlayerSlot[] = data?.roster ?? [];
+  const openSlots = roster.filter(
+    (p) => !p.user_id && (!config?.googleAuth || p.name !== "Oliver"),
+  );
+  const canInvite =
+    !config?.googleAuth ||
+    roster.some(
+      (slot) => slot.name === "Oliver" && slot.user_id === data?.me.id,
+    );
+  const targetPlayer =
+    openSlots.find((p) => p.name === invitePlayer)?.name ??
+    openSlots[0]?.name ??
+    "";
+  const competitionPeople = roster.map((slot) =>
+    data?.people.find((p: any) => p.id === slot.user_id),
+  );
+  const groupReady = roster.length > 0 && competitionPeople.every(Boolean);
   const unit = data?.me.unit || "lbs",
     toDisplay = (kg: number) => (unit === "lbs" ? kg / 0.45359237 : kg);
   const allExercises = new Map<
@@ -110,8 +152,8 @@ function App() {
     (e) =>
       e.equipment &&
       e.type === "weight_reps" &&
-      data?.people.length > 1 &&
-      data.people.every((p: any) =>
+      groupReady &&
+      competitionPeople.every((p: any) =>
         p.workouts.some((w: Workout) =>
           w.exercises.some(
             (x) =>
@@ -124,10 +166,30 @@ function App() {
   );
   const competition = data?.results[0],
     pending =
-      data?.competitions.filter((c: any) => !c.a_approved || !c.b_approved) ||
-      [];
+      data?.competitions.filter(
+        (c: any) =>
+          c.members.some((member: CompetitionMember) => !member.approved) &&
+          c.start_day > localDay(new Date()),
+      ) || [];
+  const scores: PlayerScore[] = competition?.results ?? [];
+  const standings = rankPlayers(scores);
   const latest = me?.imports[0],
     active = ["queued", "running"].includes(latest?.status);
+  useEffect(() => {
+    if (!data) return;
+    const update = () => {
+      if (document.visibilityState === "visible") void refresh();
+    };
+    const timer = setInterval(
+      update,
+      config?.googleAuth && !active ? 30000 : 5000,
+    );
+    document.addEventListener("visibilitychange", update);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", update);
+    };
+  }, [!!data, active, config?.googleAuth]);
   const exerciseId =
     selected || matching[0]?.id || allExercises.keys().next().value;
   const chartMap = new Map<string, any>();
@@ -179,122 +241,169 @@ function App() {
             </p>
           </div>
           <span className="story-footer">
-            PRIVATE BY DEFAULT · BUILT FOR TWO
+            PRIVATE BY DEFAULT · FOUR PLAYERS
           </span>
         </section>
         <section className="login-panel">
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              void act(async () => {
-                if (challenge) {
-                  await api("/auth/verify", { challenge, code: login.code });
-                  history.replaceState(null, "", location.pathname);
-                  await refresh();
-                } else {
-                  const r = await api("/auth/start", login);
-                  setChallenge(r.challenge);
+          {config?.googleAuth ? (
+            <div className="google-login">
+              <h2>
+                {login.invite && login.name
+                  ? `Join as ${login.name}`
+                  : "Sign in to Workout Competition"}
+              </h2>
+              <p className="muted">
+                {login.invite
+                  ? "Use the Google account your invitation was issued to."
+                  : "Use the Google account linked to your player slot."}
+              </p>
+              {error && (
+                <div role="alert" className="alert error">
+                  {error}
+                </div>
+              )}
+              {!config.googleReady && (
+                <div className="alert">Google sign-in is being set up.</div>
+              )}
+              <button
+                type="button"
+                className="secondary wide google-button"
+                disabled={busy || !config.googleReady}
+                onClick={() =>
+                  void act(async () => {
+                    const result = await api("/auth/google/start", {
+                      invite: login.invite || undefined,
+                    });
+                    location.assign(result.url);
+                  })
                 }
-              });
-            }}
-          >
-            <p className="eyebrow">WELCOME TO YOUR TRAINING SPACE</p>
-            <h2>{challenge ? "Check your phone" : "Let’s get stronger."}</h2>
-            <p className="muted">
-              {challenge
-                ? "Enter your six-digit verification code."
-                : "Sign in or join with your private invitation."}
-            </p>
-            {config?.devAuth && (
-              <div className="alert">
-                Local test mode · fictional accounts only. Verification code:
-                123456.
-              </div>
-            )}
-            {!config?.devAuth && !config?.smsReady && (
-              <div className="alert">
-                SMS login needs server setup. Add your Twilio Verify credentials
-                to enable sign-in.
-              </div>
-            )}
-            {!challenge ? (
-              <>
+              >
+                {busy ? "Opening Google…" : "Sign in with Google"}
+              </button>
+            </div>
+          ) : config ? (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                void act(async () => {
+                  if (challenge) {
+                    await api("/auth/verify", { challenge, code: login.code });
+                    history.replaceState(null, "", location.pathname);
+                    await refresh();
+                  } else {
+                    const r = await api("/auth/start", login);
+                    setChallenge(r.challenge);
+                  }
+                });
+              }}
+            >
+              <p className="eyebrow">WELCOME TO YOUR TRAINING SPACE</p>
+              <h2>{challenge ? "Check your phone" : "Let’s get stronger."}</h2>
+              <p className="muted">
+                {challenge
+                  ? "Enter your six-digit verification code."
+                  : "Sign in or join with your private invitation."}
+              </p>
+              {config?.devAuth && (
+                <div className="alert">
+                  Local test mode · fictional accounts only. Verification code:
+                  123456.
+                </div>
+              )}
+              {!config?.devAuth && !config?.smsReady && (
+                <div className="alert">
+                  SMS login needs server setup. Add your Twilio Verify
+                  credentials to enable sign-in.
+                </div>
+              )}
+              {!challenge ? (
+                <>
+                  <label>
+                    Your name
+                    <input
+                      required
+                      autoComplete="name"
+                      value={login.name}
+                      onChange={(e) =>
+                        setLogin({ ...login, name: e.target.value })
+                      }
+                      placeholder="Oliver"
+                    />
+                  </label>
+                  <label>
+                    Phone number
+                    <input
+                      required
+                      type="tel"
+                      autoComplete="tel"
+                      value={login.phone}
+                      onChange={(e) =>
+                        setLogin({ ...login, phone: e.target.value })
+                      }
+                      placeholder="+1 555 123 4567"
+                    />
+                    <small>Include your country code, with no spaces.</small>
+                  </label>
+                  <label>
+                    Invitation code{" "}
+                    <span className="muted">(new accounts)</span>
+                    <input
+                      value={login.invite}
+                      onChange={(e) =>
+                        setLogin({ ...login, invite: e.target.value })
+                      }
+                      placeholder="Your private invitation"
+                    />
+                  </label>
+                </>
+              ) : (
                 <label>
-                  Your name
+                  Verification code
                   <input
                     required
-                    autoComplete="name"
-                    value={login.name}
+                    inputMode="numeric"
+                    pattern="[0-9]{6}"
+                    autoComplete="one-time-code"
+                    value={login.code}
                     onChange={(e) =>
-                      setLogin({ ...login, name: e.target.value })
+                      setLogin({ ...login, code: e.target.value })
                     }
-                    placeholder="Oliver"
                   />
                 </label>
-                <label>
-                  Phone number
-                  <input
-                    required
-                    type="tel"
-                    autoComplete="tel"
-                    value={login.phone}
-                    onChange={(e) =>
-                      setLogin({ ...login, phone: e.target.value })
-                    }
-                    placeholder="+1 555 123 4567"
-                  />
-                  <small>Include your country code, with no spaces.</small>
-                </label>
-                <label>
-                  Invitation code <span className="muted">(new accounts)</span>
-                  <input
-                    value={login.invite}
-                    onChange={(e) =>
-                      setLogin({ ...login, invite: e.target.value })
-                    }
-                    placeholder="Your private invitation"
-                  />
-                </label>
-              </>
-            ) : (
-              <label>
-                Verification code
-                <input
-                  required
-                  inputMode="numeric"
-                  pattern="[0-9]{6}"
-                  autoComplete="one-time-code"
-                  value={login.code}
-                  onChange={(e) => setLogin({ ...login, code: e.target.value })}
-                />
-              </label>
-            )}
-            {error && (
+              )}
+              {error && (
+                <div role="alert" className="alert error">
+                  {error}
+                </div>
+              )}
+              <button className="primary wide" disabled={busy}>
+                {busy
+                  ? "One moment…"
+                  : challenge
+                    ? "Enter dashboard →"
+                    : "Send verification code →"}
+              </button>
+              {challenge && (
+                <button
+                  type="button"
+                  className="text-button"
+                  onClick={() => setChallenge("")}
+                >
+                  Use another number or request a new code
+                </button>
+              )}
+              <p className="fine-print">
+                A player can see your workouts only when you both agree to
+                share.
+              </p>
+            </form>
+          ) : (
+            error && (
               <div role="alert" className="alert error">
                 {error}
               </div>
-            )}
-            <button className="primary wide" disabled={busy}>
-              {busy
-                ? "One moment…"
-                : challenge
-                  ? "Enter dashboard →"
-                  : "Send verification code →"}
-            </button>
-            {challenge && (
-              <button
-                type="button"
-                className="text-button"
-                onClick={() => setChallenge("")}
-              >
-                Use another number or request a new code
-              </button>
-            )}
-            <p className="fine-print">
-              Your workouts are visible to your partner only after you both
-              agree to share.
-            </p>
-          </form>
+            )
+          )}
         </section>
       </main>
     );
@@ -440,7 +549,7 @@ function App() {
                   <p>
                     {competition
                       ? `Baseline week: ${date(dayStartForLabel(competition.start_day))}. Only your agreed exercises count.`
-                      : "Connect your workouts, invite your training partner, and set your shared challenge."}
+                      : "Connect your workouts and set up the four-player challenge."}
                   </p>
                   <button
                     className="light-button"
@@ -540,35 +649,49 @@ function App() {
                 <section className="card">
                   <p className="eyebrow">CONNECTED, ON YOUR TERMS</p>
                   <h3>Your circle</h3>
-                  {data.sharing.length ? (
-                    data.sharing.map((s: any) => (
-                      <div className="circle-row" key={s.partner_id}>
-                        <span className="avatar pale">{s.partner_name[0]}</span>
+                  {roster.map((player) => {
+                    const own = player.user_id === data.me.id;
+                    const sharing = data.sharing.find(
+                      (s: any) => s.partner_id === player.user_id,
+                    );
+                    const shared = sharing?.a_consent && sharing?.b_consent;
+                    const status = own
+                      ? "You"
+                      : !player.user_id
+                        ? "Not joined"
+                        : shared
+                          ? "Sharing"
+                          : "Private";
+                    return (
+                      <div className="circle-row" key={player.name}>
+                        <span className="avatar pale">{player.name[0]}</span>
                         <div>
-                          <strong>{s.partner_name}</strong>
+                          <strong>{player.name}</strong>
                           <small>
-                            {s.a_consent && s.b_consent
-                              ? "Sharing is on"
-                              : "Waiting for mutual consent"}
+                            {own
+                              ? "Your account"
+                              : !player.user_id
+                                ? "Invitation available"
+                                : shared
+                                  ? "Sharing is on"
+                                  : "Mutual consent required"}
                           </small>
                         </div>
                         <span
-                          className={
-                            "status " +
-                            (s.a_consent && s.b_consent ? "good" : "")
-                          }
+                          className={"status " + (own || shared ? "good" : "")}
                         >
-                          {s.a_consent && s.b_consent ? "Connected" : "Private"}
+                          {status}
                         </span>
                       </div>
-                    ))
-                  ) : (
-                    <Empty
-                      title="Better with a training partner"
-                      text="Invite Blake, then both choose to share your workouts."
-                      action="Invite your partner"
+                    );
+                  })}
+                  {openSlots.length > 0 && canInvite && (
+                    <button
+                      className="text-button"
                       onClick={() => setTab("Settings")}
-                    />
+                    >
+                      Invite players →
+                    </button>
                   )}
                   <div className="card-note">
                     Your competition measures improvement from your own
@@ -738,9 +861,14 @@ function App() {
                 {competition ? (
                   <>
                     <div className="score-grid">
-                      {competition.results.map((r: any) => (
+                      {(
+                        standings ??
+                        scores.map((player) => ({ player, rank: null }))
+                      ).map(({ player: r, rank }) => (
                         <div className="score" key={r.userId}>
-                          <span className="avatar pale">{r.name[0]}</span>
+                          <span className="avatar pale">
+                            {rank ?? r.name[0]}
+                          </span>
                           <h4>{r.name}</h4>
                           <strong>{percent(r.last.improvement)}</strong>
                           <p>
@@ -764,7 +892,10 @@ function App() {
                       ))}
                     </div>
                     <p className="card-note">
-                      {winner(competition.results)} · Agreed variants:{" "}
+                      {standings
+                        ? leaderboardSummary(standings)
+                        : "Rankings start when every player has enough data."}{" "}
+                      · Agreed variants:{" "}
                       {competition.choices
                         .map((x: any) => allExercises.get(x.id)?.title || x.id)
                         .join(", ")}
@@ -773,7 +904,7 @@ function App() {
                 ) : (
                   <Empty
                     title="Your next challenge is waiting"
-                    text="Sync both histories, agree on matching exercises, and choose a Monday to start."
+                    text="Have all four players sync their workouts, agree on matching exercises, and choose a Monday to start."
                   />
                 )}
               </section>
@@ -781,15 +912,32 @@ function App() {
                 <section className="card" key={co.id}>
                   <h3>Proposed competition · {co.start_day}</h3>
                   <p>
-                    {JSON.parse(co.choices)
+                    {co.choices
                       .map((x: any) => allExercises.get(x.id)?.title || x.id)
                       .join(", ")}
                   </p>
+                  <ul className="approval-list">
+                    {co.members.map((member: CompetitionMember) => (
+                      <li key={member.id}>
+                        {member.name}{" "}
+                        <span
+                          className={
+                            "status " + (member.approved ? "good" : "")
+                          }
+                        >
+                          {member.approved ? "Approved" : "Pending"}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
                   <button
                     className="primary"
                     disabled={
                       busy ||
-                      (co.a === data.me.id ? co.a_approved : co.b_approved)
+                      co.members.some(
+                        (member: CompetitionMember) =>
+                          member.id === data.me.id && member.approved,
+                      )
                     }
                     onClick={() =>
                       void act(async () => {
@@ -804,13 +952,12 @@ function App() {
               ))}
               <section className="card">
                 <h3>Start a new competition</h3>
-                {partner ? (
+                {groupReady ? (
                   <form
                     onSubmit={(e) => {
                       e.preventDefault();
                       void act(async () => {
                         await api("/app/competition", {
-                          partnerId: partner.id,
                           startDay: start,
                           choices: matching
                             .filter((x) => choices.includes(x.id))
@@ -821,7 +968,7 @@ function App() {
                             })),
                         });
                         setNotice(
-                          "Proposal saved. Your partner must approve before the start date.",
+                          "Proposal saved. The other three players must approve before the start date.",
                         );
                         await refresh();
                       });
@@ -837,7 +984,8 @@ function App() {
                       />
                     </label>
                     <p className="muted">
-                      Choose the same exercise variants from both histories.
+                      Choose exercise variants present in all four workout
+                      histories.
                     </p>
                     {matching.length ? (
                       matching.map((e) => (
@@ -858,20 +1006,23 @@ function App() {
                       ))
                     ) : (
                       <p>
-                        No matching weighted exercise variants yet. Sync both
-                        accounts first.
+                        No matching weighted exercise variants yet. Have all
+                        four players sync their workouts.
                       </p>
                     )}
                     <button
                       className="primary"
-                      disabled={busy || !choices.length}
+                      disabled={
+                        busy || !matching.some((x) => choices.includes(x.id))
+                      }
                     >
                       Propose competition
                     </button>
                   </form>
                 ) : (
                   <p className="muted">
-                    Both participants must consent to sharing first.
+                    All four players must join. Set up mutual sharing with each
+                    player to propose the rules.
                   </p>
                 )}
               </section>
@@ -959,6 +1110,11 @@ function App() {
                 <section className="card">
                   <p className="eyebrow">PRIVATE SHARING</p>
                   <h3>Your training circle</h3>
+                  <p className="muted">
+                    Choose who can see your exercises, sets, reps, weights,
+                    workout dates, progress, and body-weight history. Sharing
+                    starts when both players agree.
+                  </p>
                   {data.sharing.map((s: any) => {
                     const consent =
                       s.a === data.me.id ? s.a_consent : s.b_consent;
@@ -966,9 +1122,11 @@ function App() {
                       <div className="sharing-item" key={s.partner_id}>
                         <strong>{s.partner_name}</strong>
                         <p className="muted">
-                          Share exercises, sets, reps, weights, dates,
-                          body-weight-adjusted progress, and body-weight
-                          history. Personal notes are excluded.
+                          {s.a_consent && s.b_consent
+                            ? "Sharing is on"
+                            : consent
+                              ? "Waiting for their consent"
+                              : "Private"}
                         </p>
                         <button
                           className={consent ? "secondary" : "primary"}
@@ -983,35 +1141,85 @@ function App() {
                             })
                           }
                         >
-                          {consent ? "Stop sharing" : "I agree to share"}
+                          {consent
+                            ? `Stop sharing with ${s.partner_name}`
+                            : `Share with ${s.partner_name}`}
                         </button>
                       </div>
                     );
                   })}
-                  <button
-                    className="secondary"
-                    disabled={busy}
-                    onClick={() =>
-                      void act(async () => {
-                        const r = await api("/app/invite", {});
-                        setInviteUrl(r.url);
-                      })
-                    }
-                  >
-                    Create private invitation
-                  </button>
-                  {inviteUrl && (
-                    <label>
-                      Invitation link
-                      <input
-                        readOnly
-                        value={inviteUrl}
-                        onFocus={(e) => e.target.select()}
-                      />
-                      <small>
-                        Expires in seven days. Send this link to your partner.
-                      </small>
-                    </label>
+                  {openSlots.length > 0 && canInvite ? (
+                    <>
+                      <label>
+                        Player to invite
+                        <select
+                          value={targetPlayer}
+                          onChange={(e) => {
+                            setInvitePlayer(e.target.value);
+                            setInviteEmail("");
+                            setInviteUrl("");
+                          }}
+                        >
+                          {openSlots.map((player) => (
+                            <option key={player.name}>{player.name}</option>
+                          ))}
+                        </select>
+                      </label>
+                      {config?.googleAuth && (
+                        <label>
+                          Player’s Google email
+                          <input
+                            type="email"
+                            value={inviteEmail}
+                            autoComplete="off"
+                            onChange={(e) => {
+                              setInviteEmail(e.target.value);
+                              setInviteUrl("");
+                            }}
+                          />
+                        </label>
+                      )}
+                      <button
+                        className="secondary"
+                        disabled={
+                          busy || (!!config?.googleAuth && !inviteEmail.trim())
+                        }
+                        onClick={() =>
+                          void act(async () => {
+                            const r = await api("/app/invite", {
+                              playerName: targetPlayer,
+                              googleEmail: config?.googleAuth
+                                ? inviteEmail.trim()
+                                : undefined,
+                            });
+                            setInviteUrl(r.url);
+                          })
+                        }
+                      >
+                        Create private invitation
+                      </button>
+                      {inviteUrl && (
+                        <label>
+                          Invitation link
+                          <input
+                            readOnly
+                            value={inviteUrl}
+                            onFocus={(e) => e.target.select()}
+                          />
+                          <small>
+                            Send this link to{" "}
+                            {new URL(inviteUrl).searchParams.get("player")}. It
+                            expires in seven days.
+                          </small>
+                        </label>
+                      )}
+                    </>
+                  ) : openSlots.length > 0 ? (
+                    <p className="muted">
+                      Oliver manages invitations for the remaining players.
+                    </p>
+                  ) : (
+                    <p className="muted">All four players have joined.</p>
                   )}
                 </section>
               </div>
@@ -1027,7 +1235,7 @@ function App() {
                 </div>
                 <p className="muted">
                   The Sync button asks your own local Codex session to read
-                  Hevy. Your computer and companion must be running.
+                  Hevy. Your first sync imports your full workout history.
                 </p>
                 {data.companion ? (
                   <>
@@ -1168,16 +1376,15 @@ function App() {
 function dayStartForLabel(day: string) {
   return day + "T12:00:00Z";
 }
-function winner(results: any[]) {
-  if (results.some((r) => r.last.improvement === null))
-    return "Rankings start when both participants have enough data";
-  const [a, b] = results;
-  if (!a || !b) return "Waiting for both participants";
-  const av = Number(a.last.improvement.toFixed(2)),
-    bv = Number(b.last.improvement.toFixed(2));
-  return av === bv
-    ? "Tied this week"
-    : `${av > bv ? a.name : b.name} leads the latest completed week`;
+function leaderboardSummary(
+  standings: { player: PlayerScore; rank: number }[],
+) {
+  const leaders = standings
+    .filter((entry) => entry.rank === 1)
+    .map((entry) => entry.player.name);
+  return leaders.length === 1
+    ? `${leaders[0]} leads the latest completed week`
+    : `${new Intl.ListFormat("en").format(leaders)} are tied for first`;
 }
 function Stat({
   label,
@@ -1252,7 +1459,7 @@ function SyncStatus({ people }: { people: any[] }) {
             </div>
             <small>
               {success
-                ? `Last success ${new Date(success.completed_at).toLocaleString()} · covers ${date(success.scope_start)}–${date(success.scope_end)}`
+                ? `Last success ${new Date(success.completed_at).toLocaleString()} · ${success.scope_start === allTimeStart ? "full history" : `covers ${date(success.scope_start)}–${date(success.scope_end)}`}`
                 : "No successful full sync yet"}
             </small>
             {latest?.message && (

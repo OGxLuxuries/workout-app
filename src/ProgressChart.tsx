@@ -8,6 +8,7 @@ import {
   CartesianGrid,
   Legend,
 } from "recharts";
+const colors = ["#287058", "#bd6b36", "#375fb0", "#884a8d"];
 export default function ProgressChart({
   data,
   people,
@@ -32,7 +33,7 @@ export default function ProgressChart({
               type="monotone"
               dataKey={p.id}
               name={p.name}
-              stroke={i ? "#bd6b36" : "#287058"}
+              stroke={colors[i % colors.length]}
               strokeWidth={3}
               connectNulls={false}
             />
