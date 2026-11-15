@@ -8,6 +8,14 @@ Open [Workout Competition](https://workout.olivergomesjr.com) and choose **Conti
 
 Pair a companion using the hosted address and click **Sync workouts**. Your saved workouts are available as soon as you sign in. Your companion only needs to be running for new syncs.
 
+On your phone, open **Train** to start logging sets or repeat your last workout. Check off each completed set to start its rest timer. An unfinished workout is saved on that device. Finishing and publishing the workout requires a connection. **Activity** shows your weekly totals and recent sessions from players who share with you.
+
+On iPhone, open the dashboard in Safari and choose **Share → Add to Home Screen → Open as Web App**. On Android, open the Chrome menu and choose **Install app** or **Add to Home screen**.
+
+Workouts logged here are separate entries from Hevy imports. If you log the same session in both places, remove the in-app copy in **History** to avoid counting it twice. The competition still uses its existing coverage rules and agreed exercise variants.
+
+Training photography by [Victor Freitas on Unsplash](https://unsplash.com/photos/person-lifting-barbell-in-gym-vqDAUejnwKw).
+
 ### Deploy or update
 
 1. In Google Auth Platform, configure the existing Workout App project and create a **Web application** OAuth client. Register `https://workout.olivergomesjr.com/api/auth/google/callback` as an authorized redirect URI. The Worker requests the `openid email` scopes.

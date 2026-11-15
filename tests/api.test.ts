@@ -170,6 +170,53 @@ describe("account and sync flow with real local D1", () => {
       (await call("/app/dashboard", undefined, a)).body.people,
     ).toHaveLength(2);
   });
+  it("saves manual sessions once and shares them only with consent", async () => {
+    const id = crypto.randomUUID();
+    const workout = {
+      id,
+      startedAt: new Date(Date.now() - 900000).toISOString(),
+      finishedAt: new Date().toISOString(),
+      exercises: [
+        {
+          templateId: null,
+          title: "Bench Press",
+          equipment: "barbell",
+          sets: [{ reps: 10, weightKg: 50, warmup: false }],
+        },
+      ],
+    };
+    const path = "/app/workouts/log";
+    expect((await call(path, workout)).status).toBe(401);
+    expect((await call(path, workout, a)).body.id).toBe("manual:" + id);
+    expect((await call(path, workout, a)).status).toBe(200);
+    expect(
+      (await call(path, { ...workout, finishedAt: workout.startedAt }, a))
+        .status,
+    ).toBe(409);
+    expect(
+      await DB.prepare("SELECT COUNT(*) n FROM sets WHERE workout_id=?")
+        .bind("manual:" + id)
+        .first("n"),
+    ).toBe(1);
+    await call("/app/workouts/remove", { id }, b);
+    await call("/app/delete-data", {}, a);
+    const shared = (
+      await call("/app/dashboard", undefined, b)
+    ).body.people.find((p: any) => p.id === aid);
+    expect(shared.workouts.map((w: any) => w.id)).toEqual(["manual:" + id]);
+    await call("/app/sharing", { partnerId: bid, consent: false }, a);
+    expect(
+      (await call("/app/dashboard", undefined, b)).body.people.some(
+        (p: any) => p.id === aid,
+      ),
+    ).toBe(false);
+    await call("/app/sharing", { partnerId: bid, consent: true }, a);
+    expect((await call("/app/workouts/remove", { id }, a)).status).toBe(200);
+    const own = (await call("/app/dashboard", undefined, a)).body.people.find(
+      (p: any) => p.id === aid,
+    );
+    expect(own.workouts).toHaveLength(0);
+  });
   it("pairs distinct source accounts and rejects reused codes", async () => {
     const code = (await call("/app/pair-code", {}, a)).body.code;
     ca = (await call("/companion/pair", { code, sourceUserId: "source-a" }))

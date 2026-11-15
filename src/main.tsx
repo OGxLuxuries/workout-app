@@ -4,7 +4,24 @@ const ProgressChart = lazy(() => import("./ProgressChart"));
 import { localDay, monday, addDays, rankPlayers } from "../shared/scoring";
 import type { Workout } from "../shared/import";
 import { allTimeStart } from "../shared/sync";
+import {
+  isManualWorkout,
+  manualPrefix,
+  type LoggedWorkout,
+} from "../shared/training";
+import {
+  Activity,
+  Icon,
+  InstallCard,
+  Train,
+  newDraft,
+  readDraft,
+  repeatedExercises,
+  storeDraft,
+  type Draft,
+} from "./workout-ui";
 import "./style.css";
+import "./mobile.css";
 
 async function api(path: string, body?: unknown) {
   const r = await fetch("/api" + path, {
@@ -55,6 +72,19 @@ const signInErrors: Record<string, string> = {
   verification: "Google sign-in could not be verified. Try again.",
   unavailable: "Google sign-in is being set up.",
 };
+const navigation = [
+  { screen: "Overview", label: "Activity", icon: "activity" },
+  { screen: "Competition", label: "Compete", icon: "compete" },
+  { screen: "Train", label: "Train", icon: "train" },
+  { screen: "Workouts", label: "History", icon: "history" },
+  { screen: "Settings", label: "You", icon: "profile" },
+] as const;
+const pageTitles: Record<string, string> = {
+  Workouts: "History",
+  Competition: "Competition",
+  Compare: "Compare",
+  Settings: "Your account",
+};
 function App() {
   const [data, setData] = useState<any>(null),
     [config, setConfig] = useState<LoginConfig | null>(null),
@@ -87,6 +117,35 @@ function App() {
   const [start, setStart] = useState(addDays(monday(localDay(new Date())), 7)),
     [choices, setChoices] = useState<string[]>([]),
     [deleteConfirm, setDeleteConfirm] = useState(false);
+  const [localDraft, setLocalDraft] = useState<{
+    owner: string;
+    value: Draft | null;
+  } | null>(null);
+  const [removeWorkout, setRemoveWorkout] = useState("");
+  const accountId: string | undefined = data?.me.id;
+  const draft =
+    localDraft?.owner === accountId ? (localDraft?.value ?? null) : null;
+  useEffect(() => {
+    if (!accountId) return;
+    const saved = readDraft(accountId);
+    setLocalDraft({ owner: accountId, value: saved });
+    setTab(saved ? "Train" : "Overview");
+  }, [accountId]);
+
+  function updateDraft(value: Draft | null) {
+    if (!accountId) return;
+    setLocalDraft({ owner: accountId, value });
+    if (!storeDraft(accountId, value))
+      setError(
+        "Draft storage is unavailable on this device. Keep the app open until you finish.",
+      );
+  }
+  function openTab(screen: string) {
+    setTab(screen);
+    setError("");
+    setNotice("");
+    window.scrollTo(0, 0);
+  }
   async function refresh() {
     try {
       setData(await api("/app/dashboard"));
@@ -225,24 +284,14 @@ function App() {
       <main className="login-layout">
         <section className="login-story">
           <div className="brand">
-            <span className="brand-icon">↗</span> WORKOUT COMPETITION
+            <span className="brand-icon">
+              <Icon name="activity" size={22} />
+            </span>{" "}
+            WORKOUT COMPETITION
           </div>
           <div>
-            <p className="eyebrow">A LITTLE COMPETITION. A LOT OF PROGRESS.</p>
-            <h1>
-              Your baseline.
-              <br />
-              Your next level.
-            </h1>
-            <p>
-              Train your way. Measure your progress.
-              <br />
-              Get stronger together.
-            </p>
+            <h1>Train together.</h1>
           </div>
-          <span className="story-footer">
-            PRIVATE BY DEFAULT · FOUR PLAYERS
-          </span>
         </section>
         <section className="login-panel">
           {config?.googleAuth ? (
@@ -279,6 +328,7 @@ function App() {
                 }
               >
                 {busy ? "Opening Google…" : "Sign in with Google"}
+                <Icon name="arrow" size={18} />
               </button>
             </div>
           ) : config ? (
@@ -410,115 +460,84 @@ function App() {
   const historyPerson =
     data.people.find((p: any) => p.id === historyUser) || me;
   return (
-    <div className="app-layout">
-      <aside className="sidebar">
-        <div className="brand">
-          <span className="brand-icon">↗</span>
-          <span>
-            WORKOUT
-            <br />
-            COMPETITION
+    <div className="app-layout mobile-app">
+      <header className="app-header">
+        <button className="app-wordmark" onClick={() => openTab("Overview")}>
+          <span className="brand-icon">
+            <Icon name="activity" size={21} />
           </span>
-        </div>
-        <div className="workspace-label">YOUR TRAINING SPACE</div>
-        <nav>
-          {[
-            ["Overview", "◫"],
-            ["Workouts", "≡"],
-            ["Compare", "↗"],
-            ["Competition", "⚑"],
-            ["Settings", "⚙"],
-          ].map(([name, icon]) => (
+          Workout<span className="wordmark-accent">Competition</span>
+        </button>
+        <button
+          className="header-avatar"
+          aria-label="Open your account"
+          onClick={() => openTab("Settings")}
+        >
+          {data.me.name[0]}
+        </button>
+      </header>
+      <nav className="app-nav" aria-label="Main navigation">
+        {navigation.map(({ screen, label, icon }) => {
+          const current =
+            screen === tab || (screen === "Competition" && tab === "Compare");
+          return (
             <button
-              key={name}
-              aria-label={name}
-              className={tab === name ? "nav active" : "nav"}
-              onClick={() => {
-                setTab(name);
-                setError("");
-                setNotice("");
-              }}
+              key={screen}
+              aria-current={current ? "page" : undefined}
+              className={screen === "Train" ? "nav-train" : ""}
+              onClick={() => openTab(screen)}
             >
-              <span>{icon}</span>
-              {name}
+              <span className="nav-glyph">
+                <Icon name={icon} />
+              </span>
+              <span>{label}</span>
             </button>
-          ))}
-        </nav>
-        <div className="sidebar-bottom">
-          <div className="privacy">
-            <span>◈</span>
-            <div>
-              <strong>Just your circle</strong>
-              <small>Your progress stays private.</small>
-            </div>
-          </div>
-          <button className="profile" onClick={() => setTab("Settings")}>
-            <span className="avatar">{data.me.name[0]}</span>
-            <span>
-              <strong>{data.me.name}</strong>
-              <small>Your account</small>
-            </span>
-            <span>↗</span>
-          </button>
-        </div>
-      </aside>
+          );
+        })}
+      </nav>
       <main className="main">
-        <header className="topbar">
-          <span>YOUR PROGRESS, IN PERSPECTIVE</span>
-          <span className="date">
-            {new Date().toLocaleDateString("en-US", {
-              weekday: "long",
-              month: "short",
-              day: "numeric",
-            })}
-          </span>
-        </header>
         <div className="page">
-          <div className="page-heading">
-            <div>
-              <p className="eyebrow">
-                {tab === "Overview" ? "THE WORK ADDS UP" : tab.toUpperCase()}
-              </p>
-              <h1>
-                {tab === "Overview"
-                  ? `Keep moving, ${data.me.name}.`
-                  : tab === "Workouts"
-                    ? "Every session counts."
-                    : tab === "Compare"
-                      ? "See your progress."
-                      : tab === "Competition"
-                        ? "Stronger, together."
-                        : "Make it yours."}
-              </h1>
-              <p className="muted">
-                {tab === "Overview"
-                  ? "A clear view of your training. A little motivation from your circle."
-                  : tab === "Workouts"
-                    ? "Your actual Hevy workouts, brought here by your local Codex companion."
-                    : tab === "Compare"
-                      ? "Same exercise. Your own starting point."
-                      : tab === "Competition"
-                        ? "Improvement is the goal. Your first week is the benchmark."
-                        : "Manage your profile, connections, and privacy."}
-              </p>
+          {pageTitles[tab] && (
+            <div className="page-heading mobile-heading">
+              <h1>{pageTitles[tab]}</h1>
+              {tab === "Workouts" && (
+                <button
+                  className="outline"
+                  disabled={busy || active}
+                  onClick={() =>
+                    void act(async () => {
+                      await api("/app/sync", {});
+                      setNotice(
+                        "Sync requested. Your local Codex companion will read Hevy.",
+                      );
+                      await refresh();
+                    })
+                  }
+                >
+                  <span className={active ? "spin" : ""}>
+                    <Icon name="sync" size={17} />
+                  </span>
+                  {active ? "Syncing" : "Sync workouts"}
+                </button>
+              )}
             </div>
-            <button
-              className="primary"
-              disabled={busy || active}
-              onClick={() =>
-                void act(async () => {
-                  await api("/app/sync", {});
-                  setNotice(
-                    "Sync requested. Your local Codex companion will read Hevy.",
-                  );
-                  await refresh();
-                })
-              }
-            >
-              <span className={active ? "spin" : ""}>⟳</span>{" "}
-              {active ? "Sync in progress" : "Sync workouts"}
-            </button>
-          </div>
+          )}
+          {(tab === "Competition" || tab === "Compare") && (
+            <nav className="segment" aria-label="Competition views">
+              <button
+                aria-current={tab === "Competition" ? "page" : undefined}
+                onClick={() => openTab("Competition")}
+              >
+                Standings
+              </button>
+              <button
+                aria-current={tab === "Compare" ? "page" : undefined}
+                onClick={() => openTab("Compare")}
+              >
+                Exercises
+              </button>
+            </nav>
+          )}
           {config?.devAuth && (
             <div className="alert">
               LOCAL TEST MODE · Accounts and SMS verification are simulated.
@@ -537,170 +556,48 @@ function App() {
             </div>
           )}
           {tab === "Overview" && (
-            <>
-              <section className="hero">
-                <div>
-                  <p className="eyebrow">THIS WEEK’S COMPETITION</p>
-                  <h2>
-                    {competition
-                      ? "Progress over personal records."
-                      : "A stronger you starts here."}
-                  </h2>
-                  <p>
-                    {competition
-                      ? `Baseline week: ${date(dayStartForLabel(competition.start_day))}. Only your agreed exercises count.`
-                      : "Connect your workouts and set up the four-player challenge."}
-                  </p>
-                  <button
-                    className="light-button"
-                    onClick={() =>
-                      setTab(competition ? "Competition" : "Settings")
-                    }
-                  >
-                    {competition ? "View competition" : "Set up your circle"}{" "}
-                    <span>↗</span>
-                  </button>
-                </div>
-                <div className="hero-art" aria-hidden="true">
-                  <div className="art-grid" />
-                  <div className="bar bar1" />
-                  <div className="bar bar2" />
-                  <div className="bar bar3" />
-                  <div className="bar bar4" />
-                  <span className="art-arrow">↗</span>
-                  <span className="art-label">YOU vs. YOUR BASELINE</span>
-                </div>
-              </section>
-              <section className="stats">
-                <Stat
-                  label="YOUR WEEKLY IMPROVEMENT"
-                  value={percent(
-                    competition?.results.find(
-                      (r: any) => r.userId === data.me.id,
-                    )?.last.improvement ?? null,
-                  )}
-                  detail="Latest completed week · relative to baseline"
-                />
-                <Stat
-                  label="WORKOUTS IMPORTED"
-                  value={String(me.workouts.length)}
-                  detail={
-                    me.workouts.length
-                      ? "Your training history, all in one place"
-                      : "Your first sync gets things started"
-                  }
-                />
-                <Stat
-                  label="CURRENT BODY WEIGHT"
-                  value={
-                    me.weights[0] ? toDisplay(me.weights[0].kg).toFixed(1) : "—"
-                  }
-                  suffix={unit}
-                  detail={
-                    me.weights[0]
-                      ? `Recorded ${me.weights[0].day}`
-                      : "Add a dated weight to calculate progress"
-                  }
-                />
-              </section>
-              <div className="two-column">
-                <section className="card">
-                  <div className="section-heading">
-                    <div>
-                      <p className="eyebrow">YOUR TRAINING LOG</p>
-                      <h3>Recent sessions</h3>
-                    </div>
-                    <button
-                      className="text-button"
-                      onClick={() => setTab("Workouts")}
-                    >
-                      View all ↗
-                    </button>
-                  </div>
-                  {me.workouts.length ? (
-                    me.workouts.slice(0, 4).map((w: Workout) => (
-                      <div className="workout-row" key={w.id}>
-                        <span className="session-icon">↗</span>
-                        <div>
-                          <strong>
-                            {w.exercises
-                              .slice(0, 2)
-                              .map((e) => e.title)
-                              .join(" + ") || "Workout"}
-                          </strong>
-                          <small>
-                            {date(w.start_time)} · {w.exercises.length}{" "}
-                            exercises ·{" "}
-                            {w.exercises.reduce((n, e) => n + e.sets.length, 0)}{" "}
-                            sets
-                          </small>
-                        </div>
-                      </div>
-                    ))
-                  ) : (
-                    <Empty
-                      title="Your first session belongs here"
-                      text="Pair your companion in Settings, then click Sync workouts. Your history will appear automatically."
-                      action="Set up connection"
-                      onClick={() => setTab("Settings")}
-                    />
-                  )}
-                </section>
-                <section className="card">
-                  <p className="eyebrow">CONNECTED, ON YOUR TERMS</p>
-                  <h3>Your circle</h3>
-                  {roster.map((player) => {
-                    const own = player.user_id === data.me.id;
-                    const sharing = data.sharing.find(
-                      (s: any) => s.partner_id === player.user_id,
-                    );
-                    const shared = sharing?.a_consent && sharing?.b_consent;
-                    const status = own
-                      ? "You"
-                      : !player.user_id
-                        ? "Not joined"
-                        : shared
-                          ? "Sharing"
-                          : "Private";
-                    return (
-                      <div className="circle-row" key={player.name}>
-                        <span className="avatar pale">{player.name[0]}</span>
-                        <div>
-                          <strong>{player.name}</strong>
-                          <small>
-                            {own
-                              ? "Your account"
-                              : !player.user_id
-                                ? "Invitation available"
-                                : shared
-                                  ? "Sharing is on"
-                                  : "Mutual consent required"}
-                          </small>
-                        </div>
-                        <span
-                          className={"status " + (own || shared ? "good" : "")}
-                        >
-                          {status}
-                        </span>
-                      </div>
-                    );
-                  })}
-                  {openSlots.length > 0 && canInvite && (
-                    <button
-                      className="text-button"
-                      onClick={() => setTab("Settings")}
-                    >
-                      Invite players →
-                    </button>
-                  )}
-                  <div className="card-note">
-                    Your competition measures improvement from your own
-                    baseline, adjusted for body weight.
-                  </div>
-                </section>
-              </div>
-              <SyncStatus people={data.people} />
-            </>
+            <Activity
+              name={data.me.name}
+              userId={data.me.id}
+              draft={draft}
+              people={data.people}
+              roster={roster}
+              openTrain={() => {
+                if (!draft) updateDraft(newDraft(unit));
+                openTab("Train");
+              }}
+              openCompetition={() => openTab("Competition")}
+              openHistory={(owner, workout) => {
+                setHistoryUser(owner ?? data.me.id);
+                setExpanded(workout ?? "");
+                openTab("Workouts");
+              }}
+            />
+          )}
+          {tab === "Train" && (
+            <Train
+              key={data.me.id}
+              draft={draft}
+              update={updateDraft}
+              busy={busy}
+              ownWorkouts={me.workouts}
+              exerciseOptions={[...allExercises.values()]}
+              start={(previous) => {
+                const next = newDraft(unit);
+                if (previous)
+                  next.exercises = repeatedExercises(previous, unit);
+                updateDraft(next);
+              }}
+              commit={async (log: LoggedWorkout) =>
+                act(async () => {
+                  await api("/app/workouts/log", log);
+                  updateDraft(null);
+                  openTab("Overview");
+                  setNotice("Workout saved.");
+                  await refresh();
+                })
+              }
+            />
           )}
           {tab === "Workouts" && (
             <section className="card">
@@ -723,6 +620,7 @@ function App() {
                   <article className="history-item" key={w.id}>
                     <button
                       className="history-toggle"
+                      aria-expanded={expanded === w.id}
                       onClick={() => setExpanded(expanded === w.id ? "" : w.id)}
                     >
                       <span>
@@ -736,7 +634,8 @@ function App() {
                         <small>
                           {w.exercises.length} exercises ·{" "}
                           {w.exercises.reduce((n, e) => n + e.sets.length, 0)}{" "}
-                          sets
+                          sets ·{" "}
+                          {isManualWorkout(w.id) ? "Logged in app" : "Hevy"}
                         </small>
                       </span>
                       <span>{expanded === w.id ? "−" : "+"}</span>
@@ -776,12 +675,52 @@ function App() {
                           </table>
                         </div>
                       ))}
+                    {expanded === w.id &&
+                      historyPerson.id === accountId &&
+                      isManualWorkout(w.id) && (
+                        <div className="history-actions">
+                          {removeWorkout === w.id ? (
+                            <>
+                              <span>Remove this logged workout?</span>
+                              <button
+                                className="danger"
+                                disabled={busy}
+                                onClick={() =>
+                                  void act(async () => {
+                                    await api("/app/workouts/remove", {
+                                      id: w.id.slice(manualPrefix.length),
+                                    });
+                                    setRemoveWorkout("");
+                                    setExpanded("");
+                                    await refresh();
+                                  })
+                                }
+                              >
+                                Remove
+                              </button>
+                              <button
+                                className="text-button"
+                                onClick={() => setRemoveWorkout("")}
+                              >
+                                Cancel
+                              </button>
+                            </>
+                          ) : (
+                            <button
+                              className="text-button danger-text"
+                              onClick={() => setRemoveWorkout(w.id)}
+                            >
+                              Remove logged workout
+                            </button>
+                          )}
+                        </div>
+                      )}
                   </article>
                 ))
               ) : (
                 <Empty
                   title="No workouts yet"
-                  text="Sync your Hevy history through your paired Codex companion."
+                  text="Start a workout in Train or sync your Hevy history."
                 />
               )}
             </section>
@@ -1030,6 +969,7 @@ function App() {
           )}
           {tab === "Settings" && (
             <>
+              <InstallCard />
               <div className="two-column">
                 <section className="card">
                   <p className="eyebrow">YOUR PROFILE</p>
@@ -1316,8 +1256,8 @@ function App() {
               <section className="card danger-zone">
                 <h3>Your data, your choice</h3>
                 <p>
-                  Delete your imported workouts, import history, and calculated
-                  results. Your account and body-weight entries stay available.
+                  Delete your Hevy imports and import history. Workouts logged
+                  in this app stay in History.
                 </p>
                 {deleteConfirm ? (
                   <div className="button-row">
@@ -1364,17 +1304,10 @@ function App() {
               </section>
             </>
           )}
-          <footer>
-            WORKOUT COMPETITION{" "}
-            <span>Progress is personal. Keep showing up.</span>
-          </footer>
         </div>
       </main>
     </div>
   );
-}
-function dayStartForLabel(day: string) {
-  return day + "T12:00:00Z";
 }
 function leaderboardSummary(
   standings: { player: PlayerScore; rank: number }[],
@@ -1385,27 +1318,6 @@ function leaderboardSummary(
   return leaders.length === 1
     ? `${leaders[0]} leads the latest completed week`
     : `${new Intl.ListFormat("en").format(leaders)} are tied for first`;
-}
-function Stat({
-  label,
-  value,
-  detail,
-  suffix,
-}: {
-  label: string;
-  value: string;
-  detail: string;
-  suffix?: string;
-}) {
-  return (
-    <section className="stat">
-      <p className="eyebrow">{label}</p>
-      <strong>
-        {value} <small>{suffix}</small>
-      </strong>
-      <p>{detail}</p>
-    </section>
-  );
 }
 function Empty({
   title,

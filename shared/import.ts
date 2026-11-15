@@ -1,5 +1,5 @@
 import { z } from "zod";
-
+import { isManualWorkout } from "./training";
 
 const nullableNumber = z.number().finite().nonnegative().nullable();
 export const setSchema = z
@@ -54,6 +54,7 @@ export function validatePage(input: unknown): ImportPage {
   if (new Set(p.workouts.map((w) => w.id)).size !== p.workouts.length)
     throw new Error("Duplicate workout IDs in a page.");
   for (const w of p.workouts) {
+    if (isManualWorkout(w.id)) throw new Error("Invalid Hevy workout ID.");
     if (Date.parse(w.end_time) < Date.parse(w.start_time))
       throw new Error("Workout ends before it starts.");
     if (new Set(w.exercises.map((e) => e.index)).size !== w.exercises.length)

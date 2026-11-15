@@ -34,13 +34,13 @@ try {
     await page.getByLabel("Verification code", { exact: true }).fill("123456");
     await page.getByRole("button", { name: "Enter dashboard" }).click();
   }
-  await page.getByRole("heading", { name: /Keep moving/ }).waitFor();
+  await page.getByRole("heading", { name: /Let.s train/ }).waitFor();
   await page.screenshot({
     path: ".local/dashboard-desktop.png",
     fullPage: true,
   });
   await context.storageState({ path: ".local/browser-state.json" });
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByRole("button", { name: "You", exact: true }).click();
   if (
     !(await page
       .getByRole("button", { name: "Revoke companion", exact: true })
@@ -82,6 +82,8 @@ try {
       { timeout: 20000 },
     )
     .toBe(true);
+  if (process.env.CHECK_FULL_SYNC === "1")
+    await page.getByRole("button", { name: "History", exact: true }).click();
   const requestDone = page.waitForResponse(
     (r) => r.url().endsWith("/api/app/sync") && r.request().method() === "POST",
   );
@@ -121,7 +123,7 @@ try {
   );
   if (run.status !== "completed")
     throw new Error(run.message || "Live sync failed.");
-  await page.getByRole("button", { name: "Workouts", exact: true }).click();
+  await page.getByRole("button", { name: "History", exact: true }).click();
   if (own.workouts.length) {
     await page.locator(".history-toggle").first().waitFor();
     await page.locator(".history-toggle").first().click();
@@ -132,7 +134,7 @@ try {
     path: ".local/real-workout-check.png",
     fullPage: true,
   });
-  await page.getByRole("button", { name: "Overview", exact: true }).click();
+  await page.getByRole("button", { name: "Activity", exact: true }).click();
   await page.screenshot({
     path: ".local/dashboard-desktop.png",
     fullPage: true,

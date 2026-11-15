@@ -12,15 +12,9 @@ try {
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message));
   await page.goto("http://localhost:5173");
-  for (const tab of [
-    "Overview",
-    "Workouts",
-    "Compare",
-    "Competition",
-    "Settings",
-  ]) {
+  for (const tab of ["Activity", "History", "Train", "Compete", "You"]) {
     await page.getByRole("button", { name: tab, exact: true }).click();
-    await expect(page.locator(".page-heading h1")).toBeVisible();
+    await expect(page.locator("main h1")).toBeVisible();
   }
   const origin = "http://localhost:5173";
   const playerToInvite = page.getByLabel("Player to invite");
@@ -60,26 +54,28 @@ try {
   await b.getByRole("button", { name: "Send verification code" }).click();
   await b.getByLabel("Verification code", { exact: true }).fill("123456");
   await b.getByRole("button", { name: "Enter dashboard" }).click();
-  await b.getByRole("heading", { name: /Keep moving/ }).waitFor();
-  await b.getByRole("button", { name: "Settings", exact: true }).click();
+  await b.getByRole("heading", { name: /Let.s train/ }).waitFor();
+  await b.getByRole("button", { name: "You", exact: true }).click();
   const consent = b.getByRole("button", {
     name: /^Share with Oliver/,
   });
   if (await consent.count()) await consent.click();
   await page.reload();
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByRole("button", { name: "You", exact: true }).click();
   await page.getByRole("button", { name: /^Share with Blake/ }).click();
   await b.reload();
-  await b.getByRole("button", { name: "Workouts", exact: true }).click();
+  await b.getByRole("button", { name: "History", exact: true }).click();
   await expect(b.getByLabel("Participant").locator("option")).toHaveCount(2);
   await page.getByRole("button", { name: /^Stop sharing with Blake/ }).click();
   await b.reload();
-  await b.getByRole("button", { name: "Workouts", exact: true }).click();
+  await b.getByRole("button", { name: "History", exact: true }).click();
   await expect(b.getByLabel("Participant").locator("option")).toHaveCount(1);
-  await page.getByRole("button", { name: "Overview", exact: true }).click();
+  await page.getByRole("button", { name: "Activity", exact: true }).click();
   for (const player of ["Oliver", "Tashi", "Jason", "Blake"]) {
     await expect(
-      page.locator(".circle-row").getByText(player, { exact: true }),
+      page
+        .locator(".week-row")
+        .getByText(player === "Oliver" ? "You" : player, { exact: true }),
     ).toBeVisible();
   }
   await page.setViewportSize({ width: 390, height: 844 });

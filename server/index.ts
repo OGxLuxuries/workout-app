@@ -15,6 +15,8 @@ import {
   type ImportPage,
 } from "../shared/import";
 import { allTimeStart } from "../shared/sync";
+import { manualPrefix } from "../shared/training";
+import { loggedWorkoutSchema } from "../shared/training-schema";
 import {
   addDays,
   dayStart,
@@ -652,8 +654,131 @@ app.post("/api/app/delete-data", async (c) => {
   const id = c.get("user").id;
   await db(c).batch([
     db(c).prepare("DELETE FROM import_runs WHERE user_id=?").bind(id),
-    db(c).prepare("DELETE FROM workouts WHERE user_id=?").bind(id),
+    db(c)
+      .prepare(
+        "DELETE FROM workouts WHERE user_id=? AND source_id NOT LIKE 'manual:%'",
+      )
+      .bind(id),
   ]);
+  return c.json({ ok: true });
+});
+app.post("/api/app/workouts/log", async (c) => {
+  const input = loggedWorkoutSchema.parse(await c.req.json());
+  const userId = c.get("user").id;
+  const start = new Date(input.startedAt);
+  const end = new Date(input.finishedAt);
+  if (+start > +end || +end > Date.now() + 120000)
+    fail("Check your device time and try saving again.");
+
+  const workout: Workout = {
+    id: manualPrefix + input.id,
+    start_time: start.toISOString(),
+    end_time: end.toISOString(),
+    updated_at: end.toISOString(),
+    exercises: await Promise.all(
+      input.exercises.map(async (entry, index) => {
+        const known = entry.templateId
+          ? await one<{
+              title: string;
+              equipment: string | null;
+              exercise_type: string | null;
+            }>(
+              c,
+              `SELECT e.title,e.equipment,e.exercise_type FROM exercises e
+        WHERE e.template_id=? AND (e.user_id=? OR EXISTS(
+          SELECT 1 FROM sharing s WHERE s.a_consent=1 AND s.b_consent=1
+          AND ((s.a=? AND s.b=e.user_id) OR (s.b=? AND s.a=e.user_id))
+        )) ORDER BY e.user_id<>? LIMIT 1`,
+              entry.templateId,
+              userId,
+              userId,
+              userId,
+              userId,
+            )
+          : null;
+        if (entry.templateId && !known)
+          fail(
+            "An exercise is no longer in your library. Remove it or add it as a custom exercise.",
+            409,
+          );
+        const title = entry.title.replace(/\s+/g, " ");
+        const variant = [
+          entry.equipment,
+          title.normalize("NFKC").toLowerCase(),
+        ].join(":");
+        const bodyweight = known
+          ? known.exercise_type === "reps_only"
+          : entry.equipment === "bodyweight";
+        return {
+          index,
+          exercise_template_id:
+            entry.templateId ?? "logged:" + (await hash(variant)),
+          title: known?.title ?? title,
+          equipment: known ? known.equipment : entry.equipment,
+          exercise_type: known
+            ? known.exercise_type
+            : bodyweight
+              ? "reps_only"
+              : "weight_reps",
+          sets: entry.sets.map((s, index) => ({
+            index,
+            type: s.warmup ? "warmup" : "normal",
+            reps: s.reps,
+            weight_kg: bodyweight ? null : s.weightKg,
+          })),
+        };
+      }),
+    ),
+  };
+  const data = canonical(workout);
+  const [saved] = await db(c).batch([
+    db(c)
+      .prepare(
+        `INSERT INTO workouts(user_id,source_id,updated_at,start_time,data)
+      VALUES(?,?,?,?,?) ON CONFLICT(user_id,source_id) DO NOTHING`,
+      )
+      .bind(userId, workout.id, workout.updated_at, workout.start_time, data),
+    db(c)
+      .prepare(
+        `INSERT OR IGNORE INTO exercises
+      SELECT w.user_id,w.source_id,json_extract(e.value,'$.index'),
+        json_extract(e.value,'$.exercise_template_id'),json_extract(e.value,'$.title'),
+        json_extract(e.value,'$.equipment'),json_extract(e.value,'$.exercise_type')
+      FROM workouts w,json_each(w.data,'$.exercises') e
+      WHERE w.user_id=? AND w.source_id=? AND w.data=?`,
+      )
+      .bind(userId, workout.id, data),
+    db(c)
+      .prepare(
+        `INSERT OR IGNORE INTO sets
+      SELECT w.user_id,w.source_id,json_extract(e.value,'$.index'),json_extract(s.value,'$.index'),
+        json_extract(s.value,'$.type'),json_extract(s.value,'$.reps'),json_extract(s.value,'$.weight_kg')
+      FROM workouts w,json_each(w.data,'$.exercises') e,json_each(e.value,'$.sets') s
+      WHERE w.user_id=? AND w.source_id=? AND w.data=?`,
+      )
+      .bind(userId, workout.id, data),
+  ]);
+  if (!saved.meta.changes) {
+    const existing = await one<{ data: string }>(
+      c,
+      "SELECT data FROM workouts WHERE user_id=? AND source_id=?",
+      userId,
+      workout.id,
+    );
+    if (existing?.data !== data)
+      fail("This workout was already saved. Open History to review it.", 409);
+  }
+  return c.json({ id: workout.id });
+});
+app.post("/api/app/workouts/remove", async (c) => {
+  const { id } = z
+    .object({ id: z.uuid() })
+    .strict()
+    .parse(await c.req.json());
+  await db(c)
+    .prepare("DELETE FROM workouts WHERE user_id=? AND source_id=?")
+    .bind(c.get("user").id, manualPrefix + id)
+    .run();
   return c.json({ ok: true });
 });
 async function expireRuns(c: Context<AppEnv>, id: string) {
@@ -995,7 +1120,7 @@ app.post("/api/companion/pair", async (c) => {
   );
   const priorData = await one<any>(
     c,
-    "SELECT 1 FROM workouts WHERE user_id=? UNION ALL SELECT 1 FROM import_runs WHERE user_id=? LIMIT 1",
+    "SELECT 1 FROM workouts WHERE user_id=? AND source_id NOT LIKE 'manual:%' UNION ALL SELECT 1 FROM import_runs WHERE user_id=? LIMIT 1",
     pair.user_id,
     pair.user_id,
   );
