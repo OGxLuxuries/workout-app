@@ -46,6 +46,7 @@ beforeAll(async () => {
       modules: true,
       script: 'export default {fetch(){return new Response("ok")}}',
       d1Databases: ["DB"],
+      r2Buckets: ["MEDIA"],
       compatibilityDate: "2026-11-01",
     }),
   );
@@ -1052,6 +1053,23 @@ describe("account and sync flow with real local D1", () => {
           entry.workout.id === "manual:" + id,
       ),
     ).toBe(false);
+  });
+  it("streams the Strava tutorial from private R2 only after sign-in", async () => {
+    const MEDIA = await mf.getR2Bucket("MEDIA");
+    const fixture = new Uint8Array([255, 216, 255, 217]);
+    await MEDIA.put("tutorial/strava/summary.jpg", fixture);
+    const path = "http://localhost:8787/api/app/v2/run-tutorial/summary";
+    const signedOut = await app.request(path, {}, { ...env, DB, MEDIA });
+    expect(signedOut.status).toBe(401);
+    const signedIn = await app.request(
+      path,
+      { headers: { Cookie: a } },
+      { ...env, DB, MEDIA },
+    );
+    expect(signedIn.status).toBe(200);
+    expect(signedIn.headers.get("Content-Type")).toBe("image/jpeg");
+    expect(signedIn.headers.get("Cache-Control")).toBe("private, no-store");
+    expect(new Uint8Array(await signedIn.arrayBuffer())).toEqual(fixture);
   });
   it("rejects cross-site mutations and expired sessions", async () => {
     const r = await app.request(

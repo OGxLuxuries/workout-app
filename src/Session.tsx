@@ -6,6 +6,7 @@ import {
   metricKey,
   movementTypes,
   muscles,
+  setInput,
   trainingDay,
   trainingTime,
   validMovement,
@@ -26,6 +27,12 @@ const MILE = 1609.344;
 const display = (value: number) => String(Math.round(value * 100) / 100);
 const distanceFactor = (unit?: string) => (unit === "mi" ? MILE : 1000);
 const weightFactor = (unit: string) => (unit === "lbs" ? POUNDS : 1);
+const storedFields = {
+  weight: "weightKg",
+  reps: "reps",
+  seconds: "seconds",
+  distance: "meters",
+} as const;
 type Plan = {
   weight?: string;
   reps?: string;
@@ -993,14 +1000,20 @@ export function Session({
                     draft,
                   );
                   if (!validMovement(value)) {
-                    const missing =
-                      fields.find((f) => !filled[f.key]) ?? fields[0];
+                    const invalid =
+                      fields.find(({ key }) => {
+                        const stored = storedFields[key];
+                        const input = value.sets[0][stored];
+                        return !setInput.shape[stored].safeParse(input).success;
+                      }) ??
+                      fields.find(({ key }) => !filled[key]) ??
+                      fields[0];
                     document
-                      .getElementById("set-" + set.id + "-" + missing.key)
+                      .getElementById("set-" + set.id + "-" + invalid.key)
                       ?.focus();
                     setError(
                       "Enter a valid " +
-                        missing.label.toLowerCase() +
+                        invalid.label.toLowerCase() +
                         " for this set.",
                     );
                     return;
