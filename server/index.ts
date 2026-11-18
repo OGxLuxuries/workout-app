@@ -17,6 +17,7 @@ import {
 import { allTimeStart } from "../shared/sync";
 import { manualPrefix } from "../shared/training";
 import { loggedWorkoutSchema } from "../shared/training-schema";
+import { acceptGroupInvite, cleanWorkoutMedia, workspace } from "./workspace";
 import {
   addDays,
   dayStart,
@@ -28,6 +29,13 @@ import {
 
 type Env = {
   DB: D1Database;
+  MEDIA?: R2Bucket;
+  STRAVA_CLIENT_ID?: string;
+  STRAVA_CLIENT_SECRET?: string;
+  INTEGRATION_KEY?: string;
+  VAPID_SUBJECT?: string;
+  VAPID_PUBLIC_KEY?: string;
+  VAPID_PRIVATE_KEY?: string;
   APP_ORIGIN: string;
   DEV_AUTH: string;
   AUTH_PROVIDER?: "google";
@@ -66,7 +74,7 @@ type Run = {
   page_count: number | null;
   updated_at: string;
 };
-type AppEnv = {
+export type AppEnv = {
   Bindings: Env;
   Variables: { user: User; companion: Companion };
 };
@@ -152,7 +160,11 @@ app.use("/api/*", async (c, next) => {
       (!origin || c.req.header("X-Workout-Request") !== "1")
     )
       fail("Missing browser request verification.", 403);
-    if (Number(c.req.header("Content-Length") || 0) > 2_000_000)
+    const upload = c.req.path === "/api/app/v2/media/upload";
+    if (
+      Number(c.req.header("Content-Length") || 0) >
+      (upload ? 25_000_000 : 2_000_000)
+    )
       fail("Request too large.");
   }
   await next();
@@ -254,7 +266,11 @@ app.post("/api/auth/google/start", async (c) => {
         await hash(browser),
         verifier,
         nonce,
-        invite ? await hash(invite) : null,
+        invite?.startsWith("g.")
+          ? "group:" + (await hash(invite.slice(2)))
+          : invite
+            ? await hash(invite)
+            : null,
         after(600000),
       ),
   ]);
@@ -366,10 +382,32 @@ app.get(googleCallback, async (c) => {
     return back("verification");
   }
   const loginKey = "google:" + identity.subject;
-  const user =
-    (await one<User>(c, "SELECT * FROM users WHERE login_key=?", loginKey)) ??
-    (await enrollWithGoogle(c, loginKey, identity.email, attempt.invite_hash));
+  const user = attempt.invite_hash?.startsWith("group:")
+    ? await acceptGroupInvite(
+        c,
+        loginKey,
+        identity.email,
+        attempt.invite_hash.slice(6),
+      )
+    : ((await one<User>(
+        c,
+        "SELECT * FROM users WHERE login_key=?",
+        loginKey,
+      )) ??
+      (await enrollWithGoogle(
+        c,
+        loginKey,
+        identity.email,
+        attempt.invite_hash,
+      )));
   if (!user) return back("invitation");
+  await db(c)
+    .prepare(
+      `INSERT INTO training_profiles(user_id,google_email) VALUES(?,?)
+    ON CONFLICT(user_id) DO UPDATE SET google_email=excluded.google_email`,
+    )
+    .bind(user.id, identity.email)
+    .run();
   await startSession(c, user.id, "google");
   return back();
 });
@@ -513,6 +551,52 @@ app.use("/api/app/*", async (c, next) => {
   c.set("user", user);
   await next();
 });
+app.route("/api/app/v2", workspace);
+async function canViewCloudflareCosts(c: Context<AppEnv>) {
+  const user = c.get("user");
+  return (
+    googleMode(c) &&
+    user.login_key.startsWith("google:") &&
+    Boolean(
+      await one(
+        c,
+        "SELECT 1 FROM training_profiles WHERE user_id=? AND google_email=?",
+        user.id,
+        "odgj61@gmail.com",
+      ),
+    )
+  );
+}
+app.use("/api/app/v2/admin/costs", async (c, next) => {
+  if (!(await canViewCloudflareCosts(c))) fail("Admin access required.", 403);
+  await next();
+});
+app.get("/api/app/v2/admin/costs", async (c) => {
+  return c.json({
+    entries: await rows(
+      c,
+      "SELECT month,product,cents,note,updated_at FROM cloudflare_costs ORDER BY month DESC,product",
+    ),
+  });
+});
+app.post("/api/app/v2/admin/costs", async (c) => {
+  const entry = z
+    .object({
+      month: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/),
+      product: z.enum(["Workers", "D1", "R2", "Observability"]),
+      cents: z.number().int().min(0).max(100_000_000),
+      note: z.string().trim().max(300).default(""),
+    })
+    .parse(await c.req.json());
+  await db(c)
+    .prepare(
+      `INSERT INTO cloudflare_costs VALUES(?,?,?,?,?)
+     ON CONFLICT(month,product) DO UPDATE SET cents=excluded.cents,note=excluded.note,updated_at=excluded.updated_at`,
+    )
+    .bind(entry.month, entry.product, entry.cents, entry.note, now())
+    .run();
+  return c.json({ ok: true });
+});
 app.post("/api/app/logout", async (c) => {
   await db(c)
     .prepare("DELETE FROM sessions WHERE token_hash=?")
@@ -655,11 +739,19 @@ app.post("/api/app/delete-data", async (c) => {
   await db(c).batch([
     db(c).prepare("DELETE FROM import_runs WHERE user_id=?").bind(id),
     db(c)
+      .prepare("DELETE FROM workout_import_annotations WHERE user_id=?")
+      .bind(id),
+    db(c).prepare("DELETE FROM workout_variant_links WHERE user_id=?").bind(id),
+    db(c)
+      .prepare("DELETE FROM workout_duplicate_reviews WHERE user_id=?")
+      .bind(id),
+    db(c)
       .prepare(
         "DELETE FROM workouts WHERE user_id=? AND source_id NOT LIKE 'manual:%'",
       )
       .bind(id),
   ]);
+  cleanWorkoutMedia(c, id);
   return c.json({ ok: true });
 });
 app.post("/api/app/workouts/log", async (c) => {
@@ -735,9 +827,18 @@ app.post("/api/app/workouts/log", async (c) => {
     db(c)
       .prepare(
         `INSERT INTO workouts(user_id,source_id,updated_at,start_time,data)
-      VALUES(?,?,?,?,?) ON CONFLICT(user_id,source_id) DO NOTHING`,
+      SELECT ?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM workout_details WHERE user_id=? AND workout_id=?)
+      ON CONFLICT(user_id,source_id) DO NOTHING`,
       )
-      .bind(userId, workout.id, workout.updated_at, workout.start_time, data),
+      .bind(
+        userId,
+        workout.id,
+        workout.updated_at,
+        workout.start_time,
+        data,
+        userId,
+        workout.id,
+      ),
     db(c)
       .prepare(
         `INSERT OR IGNORE INTO exercises
@@ -775,9 +876,23 @@ app.post("/api/app/workouts/remove", async (c) => {
     .object({ id: z.uuid() })
     .strict()
     .parse(await c.req.json());
+  const userId = c.get("user").id;
+  const sourceId = manualPrefix + id;
+  if (
+    await one(
+      c,
+      "SELECT 1 FROM workout_details WHERE user_id=? AND workout_id=?",
+      userId,
+      sourceId,
+    )
+  )
+    return fail("Open the current workout editor to delete this workout.", 409);
   await db(c)
-    .prepare("DELETE FROM workouts WHERE user_id=? AND source_id=?")
-    .bind(c.get("user").id, manualPrefix + id)
+    .prepare(
+      `DELETE FROM workouts WHERE user_id=? AND source_id=?
+      AND NOT EXISTS(SELECT 1 FROM workout_details d WHERE d.user_id=workouts.user_id AND d.workout_id=workouts.source_id)`,
+    )
+    .bind(userId, sourceId)
     .run();
   return c.json({ ok: true });
 });
@@ -973,6 +1088,7 @@ app.post("/api/app/competition/:id/approve", async (c) => {
 });
 app.get("/api/app/dashboard", async (c) => {
   const user = c.get("user");
+  const compact = c.req.query("compact") === "1";
   await expireRuns(c, user.id);
   const [sharing, slots] = await Promise.all([playerSharing(c), roster(c)]);
   const ids = [
@@ -988,13 +1104,17 @@ app.get("/api/app/dashboard", async (c) => {
       "SELECT id,name,unit FROM users WHERE id=?",
       id,
     );
-    const workouts = (
-      await rows<{ data: string }>(
-        c,
-        "SELECT data FROM workouts WHERE user_id=? ORDER BY start_time DESC",
-        id,
-      )
-    ).map((w) => JSON.parse(w.data) as Workout);
+    const workoutRows = await rows<{ data: string; audience: string | null }>(
+      c,
+      `SELECT w.data,COALESCE(d.audience,a.audience) audience FROM workouts w LEFT JOIN workout_details d
+          ON d.user_id=w.user_id AND d.workout_id=w.source_id
+          LEFT JOIN workout_import_annotations a ON a.user_id=w.user_id AND a.workout_id=w.source_id
+          WHERE w.user_id=? AND COALESCE(d.deleted,0)=0 AND
+          (?=1 OR COALESCE(d.audience,a.audience,'connections')='connections') ORDER BY w.start_time DESC`,
+      id,
+      Number(id === user.id),
+    );
+    const workouts = workoutRows.map((w) => JSON.parse(w.data) as Workout);
     const weights = await rows<{ day: string; kg: number }>(
       c,
       "SELECT day,kg FROM weights WHERE user_id=? ORDER BY day DESC",
@@ -1010,7 +1130,18 @@ app.get("/api/app/dashboard", async (c) => {
       "SELECT id,status,mode,scope_start,scope_end,completed_at,created_at,counts,message FROM import_runs WHERE user_id=? ORDER BY created_at DESC LIMIT 10",
       id,
     );
-    people.push({ ...profile, workouts, weights, ranges, imports });
+    people.push({
+      ...profile,
+      workouts,
+      weights,
+      ranges,
+      imports,
+      scoredWorkouts: workouts.filter(
+        (_, index) =>
+          !workoutRows[index].audience ||
+          workoutRows[index].audience === "connections",
+      ),
+    });
   }
   const competitionRows = await rows<{
     id: string;
@@ -1058,7 +1189,7 @@ app.get("/api/app/dashboard", async (c) => {
           userId: p.id,
           name: p.name,
           current: progress(
-            p.workouts,
+            p.scoredWorkouts,
             p.weights,
             co.choices,
             co.start_day,
@@ -1066,7 +1197,7 @@ app.get("/api/app/dashboard", async (c) => {
             p.ranges,
           ),
           last: progress(
-            p.workouts,
+            p.scoredWorkouts,
             p.weights,
             co.choices,
             co.start_day,
@@ -1075,11 +1206,72 @@ app.get("/api/app/dashboard", async (c) => {
           ),
         })),
     }));
+  const eligible = new Map<
+    string,
+    {
+      id: string;
+      title: string;
+      equipment: string;
+      type: string;
+      matching: boolean;
+      users: Set<string>;
+    }
+  >();
+  if (compact) {
+    for (const person of people)
+      for (const workout of person.scoredWorkouts as Workout[])
+        for (const exercise of workout.exercises) {
+          if (!exercise.equipment || exercise.exercise_type !== "weight_reps")
+            continue;
+          const id = exercise.exercise_template_id;
+          const key = JSON.stringify([
+            id,
+            exercise.equipment,
+            exercise.exercise_type,
+          ]);
+          const option = eligible.get(key) ?? {
+            id,
+            title: exercise.title,
+            equipment: exercise.equipment,
+            type: exercise.exercise_type,
+            matching: false,
+            users: new Set<string>(),
+          };
+          option.users.add(person.id);
+          eligible.set(key, option);
+        }
+  }
   return c.json({
     me: { id: user.id, name: user.name, unit: user.unit },
+    canViewCloudflareCosts: await canViewCloudflareCosts(c),
     sharing,
     roster: slots,
-    people,
+    people: people.map(({ scoredWorkouts: _scoredWorkouts, ...person }) =>
+      compact
+        ? {
+            ...person,
+            workouts: person.workouts.filter(
+              (w: Workout, index: number) =>
+                index < 8 || localDay(w.start_time) >= week,
+            ),
+            weights: person.id === user.id ? person.weights : [],
+            ranges: [],
+            imports: person.id === user.id ? person.imports : [],
+          }
+        : person,
+    ),
+    ...(compact
+      ? {
+          exerciseOptions: [...eligible.values()].map(
+            ({ users, ...option }) => ({
+              ...option,
+              matching: slots.every(
+                (slot) => slot.user_id && users.has(slot.user_id),
+              ),
+            }),
+          ),
+        }
+      : {}),
     competitions,
     results,
     companion: await one(

@@ -1,6 +1,6 @@
 # Workout Competition
 
-A private dashboard for Oliver, Tashi, Jason, and Blake to compare improvement in weekly lifting volume relative to body weight. A dashboard button starts a **local Codex session**, which reads the signed-in player's **Hevy connection** and returns validated records directly to the application.
+A private training log with routines, personal progress, and opt-in comparisons. The original competition retains the Oliver, Tashi, Jason, and Blake roster and bodyweight-normalized weekly scoring. The local Codex companion still imports validated Hevy records for people who pair it.
 
 ## Hosted dashboard
 
@@ -8,15 +8,21 @@ Open [Workout Competition](https://workout.olivergomesjr.com) and choose **Conti
 
 Pair a companion using the hosted address and click **Sync workouts**. Your saved workouts are available as soon as you sign in. Your companion only needs to be running for new syncs.
 
-On your phone, open **Train** to start logging sets or repeat your last workout. Check off each completed set to start its rest timer. An unfinished workout is saved on that device. Finishing and publishing the workout requires a connection. **Activity** shows your weekly totals and recent sessions from players who share with you.
+- **Today** starts or resumes a workout and shows recent shared activity and inbox items.
+- **Train** has the exercise library, routines, and program templates. Complete a working set to start its rest timer. The logger saves drafts by account on the device. An offline workout stays under **Pending sync** until the server confirms it.
+- **Progress** shows history, the training calendar, personal trends and records, and private measurements. Open a workout to repeat or duplicate it, create a routine, and manage local details or attachments.
+- **Compare** shows personal results, consenting peers, group medians, and competitions. The original four-player scoreboard is under **Standings**.
+- **You** has independent unit preferences, privacy and invitations, connected services, and owner-only data transfer.
 
 On iPhone, open the dashboard in Safari and choose **Share → Add to Home Screen → Open as Web App**. On Android, open the Chrome menu and choose **Install app** or **Add to Home screen**.
 
-Workouts logged here are separate entries from Hevy imports. If you log the same session in both places, remove the in-app copy in **History** to avoid counting it twice. The competition still uses its existing coverage rules and agreed exercise variants.
+If you log a session here and in Hevy, use **You → Review Hevy imports** to choose which copy contributes to personal metrics and new competitions. Map an imported exercise explicitly before combining it with a catalog variant. The original competition continues to use its agreed variants and import coverage rules.
 
 Training photography by [Victor Freitas on Unsplash](https://unsplash.com/photos/person-lifting-barbell-in-gym-vqDAUejnwKw).
 
 ### Deploy or update
+
+Use the [acceptance checklist and rollout notes](docs/workspace-acceptance.md) for an isolated rehearsal before promoting a release. Keep the Worker version that enforces workout visibility as the rollback target once users can save private workouts.
 
 1. In Google Auth Platform, configure the existing Workout App project and create a **Web application** OAuth client. Register `https://workout.olivergomesjr.com/api/auth/google/callback` as an authorized redirect URI. The Worker requests the `openid email` scopes.
 2. In the production Worker, set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `OLIVER_GOOGLE_EMAIL` as Cloudflare secrets. Keep the Google credential JSON out of the checkout and source control. After setting the secrets, the hosted configuration endpoint at `/api/config` should report `googleAuth: true` and `googleReady: true`.
@@ -90,7 +96,8 @@ The tunnel gateway keeps Wrangler's development tools local. Data survives resta
 
 ## Competition and privacy
 
-- Sharing is private by default for each pair. Both players must consent before they can see each other's workout details, body-weight history, and comparisons. Each player can withdraw consent independently. A player can view the group scoreboard once they have mutual sharing with everyone in that competition.
+- New workouts and progress measurements start private. A workout can be shared with mutual connections or a selected group. Progress photos are owner-only. Comparison consent is independent of workout visibility, and a group median requires three contributing peers besides the viewer.
+- The original competition still honors prior mutual sharing for eligible historical workouts and the shared weigh-ins entered for that competition. A player can view its scoreboard once they have mutual sharing with everyone in its roster.
 - Record body weights with their effective dates. The latest measurement on or before a workout is used. Pounds are converted to kilograms for storage.
 - Choose exercise variants present in all four histories, with resolved equipment and `weight_reps` type. Unknown variants remain visible in history.
 - Propose a future Monday and a common exercise list. All four players must approve before the start date. The latest competition approved by every member is displayed. Changes require a new proposal.
@@ -98,6 +105,7 @@ The tunnel gateway keeps Wrangler's development tools local. Data survives resta
 - Improvement is `100 × (week / baseline − 1)`. Rankings begin after week two finishes. Scores equal at two decimals tie. A zero baseline, missing body weights, or incomplete import coverage prevents ranking. A covered empty later week is −100%. Current-week results are provisional.
 - Sync coverage means the complete requested source pagination was acknowledged. Source deletions and edits missed outside the overlap require future explicit reconciliation.
 - Revoking sharing takes effect on the next request. Deleting imports cancels active jobs and removes workouts, sets, staged batches, and import history. Body weights and the account remain.
+- New group competitions freeze the roster, timezone and exact variants, with a source choice for each participant. Confirm each closed week. Mixed Hevy and native competitions also require verified import coverage.
 
 ## Data contract and implementation
 

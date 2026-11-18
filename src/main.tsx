@@ -1,27 +1,62 @@
-import React, { useEffect, useState, lazy, Suspense } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-const ProgressChart = lazy(() => import("./ProgressChart"));
 import { localDay, monday, addDays, rankPlayers } from "../shared/scoring";
-import type { Workout } from "../shared/import";
 import { allTimeStart } from "../shared/sync";
+import { Activity, Icon, InstallCard } from "./workout-ui";
+import { CompetitionRuns, ImportRun, RunSplits } from "./ImportRun";
+import { CloudflareCosts } from "./CloudflareCosts";
 import {
-  isManualWorkout,
-  manualPrefix,
-  type LoggedWorkout,
-} from "../shared/training";
-import {
-  Activity,
-  Icon,
-  InstallCard,
-  Train,
+  Session,
+  changeDraftUnits,
+  fromHistory,
   newDraft,
-  readDraft,
-  repeatedExercises,
-  storeDraft,
+  normalizeDraft,
   type Draft,
-} from "./workout-ui";
+} from "./Session";
+import { Compare, Progress } from "./Research";
+import { AccountWorkspace, TrainHome, Recap } from "./TrainHome";
+import {
+  ActivityViews,
+  Attachments,
+  Challenges,
+  DataTools,
+  Integrations,
+  PushPreferences,
+  Reconcile,
+  SharedActions,
+  unsubscribePush,
+} from "./Connected";
+import {
+  catalog,
+  defaults,
+  type Routine,
+  type WorkoutEntry,
+} from "../shared/workspace";
+import {
+  query,
+  request,
+  RequestError,
+  type SaveInput,
+  type StravaStatus,
+  type WorkoutPage,
+  type WorkspaceHome,
+} from "./workspace-api";
+import {
+  cachedHome,
+  changePending,
+  loadDraft,
+  localKeys,
+  read,
+  write,
+  type PendingWorkout,
+} from "./workspace-storage";
 import "./style.css";
 import "./mobile.css";
+import "./workspace.css";
+
+if (import.meta.env.PROD && "serviceWorker" in navigator) {
+  void navigator.serviceWorker.register("/workout-sw.js").catch(() => {});
+}
 
 async function api(path: string, body?: unknown) {
   const r = await fetch("/api" + path, {
@@ -73,17 +108,18 @@ const signInErrors: Record<string, string> = {
   unavailable: "Google sign-in is being set up.",
 };
 const navigation = [
-  { screen: "Overview", label: "Activity", icon: "activity" },
-  { screen: "Competition", label: "Compete", icon: "compete" },
+  { screen: "Overview", label: "Today", icon: "activity" },
   { screen: "Train", label: "Train", icon: "train" },
-  { screen: "Workouts", label: "History", icon: "history" },
+  { screen: "Workouts", label: "Progress", icon: "history" },
+  { screen: "Compare", label: "Compare", icon: "compete" },
   { screen: "Settings", label: "You", icon: "profile" },
 ] as const;
 const pageTitles: Record<string, string> = {
-  Workouts: "History",
+  Workouts: "Progress",
   Competition: "Competition",
   Compare: "Compare",
   Settings: "Your account",
+  ImportRun: "Import run",
 };
 function App() {
   const [data, setData] = useState<any>(null),
@@ -103,13 +139,14 @@ function App() {
       name: new URLSearchParams(location.search).get("player") || "",
       phone: "",
       code: "",
-      invite: new URLSearchParams(location.search).get("invite") || "",
+      invite: new URLSearchParams(location.search).get("groupInvite")
+        ? "g." + new URLSearchParams(location.search).get("groupInvite")
+        : new URLSearchParams(location.search).get("invite") || "",
     });
   const [pairCode, setPairCode] = useState(""),
     [inviteUrl, setInviteUrl] = useState(""),
     [invitePlayer, setInvitePlayer] = useState(""),
     [inviteEmail, setInviteEmail] = useState(""),
-    [selected, setSelected] = useState(""),
     [historyUser, setHistoryUser] = useState(""),
     [expanded, setExpanded] = useState("");
   const [weight, setWeight] = useState(""),
@@ -121,24 +158,197 @@ function App() {
     owner: string;
     value: Draft | null;
   } | null>(null);
-  const [removeWorkout, setRemoveWorkout] = useState("");
+  const [home, setHome] = useState<WorkspaceHome>({
+    settings: defaults,
+    routines: [],
+    groups: [],
+    people: [],
+    permissions: [],
+    catalog,
+  });
+  const [trainingHistory, setHistory] = useState<WorkoutEntry[]>([]);
+  const [pendingSaves, setPending] = useState<PendingWorkout[]>([]);
+  const [recap, setRecap] = useState<WorkoutEntry | null>(null);
+  const [strava, setStrava] = useState<StravaStatus | null>(null);
+  const [revision, setRevision] = useState(0);
+  const [runEntry, setRunEntry] = useState<WorkoutEntry>();
+  const [runGroup, setRunGroup] = useState<string>();
+  const flushing = useRef(new Set<string>());
+  const saving = useRef(false);
+  const activeOwner = useRef<string | undefined>(undefined);
+  const authVersion = useRef(0);
   const accountId: string | undefined = data?.me.id;
+  activeOwner.current = accountId;
   const draft =
     localDraft?.owner === accountId ? (localDraft?.value ?? null) : null;
   useEffect(() => {
     if (!accountId) return;
-    const saved = readDraft(accountId);
-    setLocalDraft({ owner: accountId, value: saved });
-    setTab(saved ? "Train" : "Overview");
+    const owner = accountId;
+    void loadDraft(owner)
+      .then((saved) => {
+        if (activeOwner.current !== owner) return;
+        setLocalDraft((current) =>
+          current?.owner === owner && current.value
+            ? current
+            : { owner, value: saved ? normalizeDraft(saved) : null },
+        );
+        if (saved) setTab("Train");
+      })
+      .catch(() => {});
+    void refreshWorkspace(owner);
+    const search = new URLSearchParams(location.search);
+    if (search.get("strava")) {
+      setTab("Settings");
+      setNotice(
+        search.get("strava") === "connected"
+          ? "Strava connected."
+          : "Strava connection was not completed.",
+      );
+    } else if (search.get("workout")) {
+      setHistoryUser(search.get("owner") ?? owner);
+      setExpanded(search.get("workout")!);
+      setTab("Workouts");
+    }
+    void flushPending(owner);
+    const online = () => void flushPending(owner);
+    window.addEventListener("online", online);
+    return () => window.removeEventListener("online", online);
   }, [accountId]);
 
   function updateDraft(value: Draft | null) {
     if (!accountId) return;
     setLocalDraft({ owner: accountId, value });
-    if (!storeDraft(accountId, value))
-      setError(
-        "Draft storage is unavailable on this device. Keep the app open until you finish.",
+    void write(localKeys(accountId).draft, value).catch(() =>
+      setError("Draft storage is unavailable on this device."),
+    );
+  }
+  async function refreshWorkspace(owner = accountId) {
+    if (!owner) return;
+    const [next, workouts, provider] = await Promise.allSettled([
+      request<WorkspaceHome>("/home"),
+      request<WorkoutPage>("/workouts"),
+      request<StravaStatus>("/integrations/strava"),
+    ]);
+    if (activeOwner.current !== owner) return;
+    if (next.status === "fulfilled") {
+      setHome(next.value);
+      void write(localKeys(owner).home, cachedHome(next.value)).catch(() => {});
+    } else {
+      const cached = await read<WorkspaceHome>(localKeys(owner).home).catch(
+        () => undefined,
       );
+      if (activeOwner.current === owner && cached) setHome(cached);
+    }
+    if (workouts.status === "fulfilled") {
+      setHistory(workouts.value.items);
+      void write(localKeys(owner).history, workouts.value.items).catch(
+        () => {},
+      );
+    } else {
+      const cached = await read<WorkoutEntry[]>(localKeys(owner).history).catch(
+        () => undefined,
+      );
+      if (activeOwner.current === owner && cached) setHistory(cached);
+    }
+    if (activeOwner.current !== owner) return;
+    if (provider.status === "fulfilled") setStrava(provider.value);
+    setRevision((n) => n + 1);
+  }
+  async function flushPending(owner: string) {
+    if (flushing.current.has(owner)) return;
+    flushing.current.add(owner);
+    const key = localKeys(owner).pending;
+    try {
+      const items = (await read<PendingWorkout[]>(key)) ?? [];
+      if (activeOwner.current === owner) setPending(items);
+      if (!navigator.onLine) return;
+      let item = items.find((p) => !p.error);
+      while (item && activeOwner.current === owner) {
+        const mutationId = item.payload.mutationId;
+        try {
+          for (const movement of item.payload.workout.movements)
+            if (movement.id.startsWith("custom:")) {
+              const { id, title, equipment, type, muscle } = movement;
+              await request("/catalog", { id, title, equipment, type, muscle });
+            }
+          const result = await request<{ id: string; revision: number }>(
+            "/workouts/commit",
+            item.payload,
+          );
+          const remaining = await changePending(owner, (current) =>
+            current.filter((x) => x.payload.mutationId !== mutationId),
+          );
+          if (activeOwner.current !== owner) break;
+          setPending(remaining);
+          const entry = await request<WorkoutEntry>(
+            query("/workouts/item", { owner, id: result.id }),
+          ).catch(() => null);
+          if (activeOwner.current !== owner) break;
+          setRecap(entry);
+          setNotice("Workout saved.");
+          if (item.payload.exportToStrava)
+            void request("/integrations/strava/deliver", { id: result.id })
+              .then(() => refreshWorkspace(owner))
+              .catch(() => {});
+          void refreshWorkspace(owner);
+          void refresh();
+        } catch (error) {
+          if (
+            !(error instanceof RequestError) ||
+            error.status === 401 ||
+            error.status >= 500
+          )
+            break;
+          const remaining = await changePending(owner, (current) =>
+            current.map((p) =>
+              p.payload.mutationId === mutationId
+                ? { ...p, error: error.message, conflict: error.status === 409 }
+                : p,
+            ),
+          );
+          if (activeOwner.current === owner) setPending(remaining);
+        }
+        item = (await read<PendingWorkout[]>(key))?.find((p) => !p.error);
+      }
+    } catch {
+      if (activeOwner.current === owner)
+        setError("Pending workouts could not be read from this device.");
+    } finally {
+      flushing.current.delete(owner);
+    }
+  }
+  async function saveTraining(payload: SaveInput) {
+    if (!accountId || saving.current) return;
+    saving.current = true;
+    try {
+      const queued = await changePending(
+        accountId,
+        (items) => [...items, { payload }],
+        payload.id,
+      );
+      if (activeOwner.current !== accountId) return;
+      setPending(queued);
+      setLocalDraft({ owner: accountId, value: null });
+      openTab("Overview");
+      setNotice("Workout queued on this device.");
+      await flushPending(accountId);
+    } finally {
+      saving.current = false;
+    }
+  }
+  async function saveRoutine(routine: Routine) {
+    await request("/routines", routine);
+    await refreshWorkspace();
+  }
+  function startTraining(value: Draft) {
+    if (
+      draft &&
+      draft.id !== value.id &&
+      !window.confirm("Replace the current draft?")
+    )
+      return;
+    updateDraft(value);
+    openTab("Train");
   }
   function openTab(screen: string) {
     setTab(screen);
@@ -146,14 +356,60 @@ function App() {
     setNotice("");
     window.scrollTo(0, 0);
   }
+  function clearWorkspace() {
+    activeOwner.current = undefined;
+    setLocalDraft(null);
+    setHome({
+      settings: defaults,
+      routines: [],
+      groups: [],
+      people: [],
+      permissions: [],
+      catalog,
+    });
+    setHistory([]);
+    setPending([]);
+    setRecap(null);
+    setStrava(null);
+    setHistoryUser("");
+    setExpanded("");
+  }
   async function refresh() {
+    const version = authVersion.current;
     try {
-      setData(await api("/app/dashboard"));
+      const next = await api("/app/dashboard?compact=1");
+      if (version !== authVersion.current) return;
+      if (activeOwner.current && activeOwner.current !== next.me.id)
+        clearWorkspace();
+      setData(next);
+      localStorage.setItem("workout-offline-account", JSON.stringify(next.me));
     } catch (e: any) {
-      if (e.status === 401) setData(null);
-      else setError(e.message);
+      if (version !== authVersion.current) return;
+      if (e.status === 401) {
+        authVersion.current++;
+        localStorage.removeItem("workout-offline-account");
+        clearWorkspace();
+        setData(null);
+      } else if (e instanceof TypeError) {
+        const raw = localStorage.getItem("workout-offline-account");
+        if (raw) {
+          const owner = JSON.parse(raw);
+          setData({
+            me: owner,
+            people: [
+              { ...owner, workouts: [], weights: [], imports: [], ranges: [] },
+            ],
+            sharing: [],
+            roster: [],
+            competitions: [],
+            results: [],
+            companion: null,
+          });
+        } else setError("Connect to the internet to sign in.");
+      } else setError(e.message);
     } finally {
-      setLoading(false);
+      if (version === authVersion.current || !activeOwner.current)
+        setLoading(false);
     }
   }
   useEffect(() => {
@@ -194,35 +450,16 @@ function App() {
   const groupReady = roster.length > 0 && competitionPeople.every(Boolean);
   const unit = data?.me.unit || "lbs",
     toDisplay = (kg: number) => (unit === "lbs" ? kg / 0.45359237 : kg);
-  const allExercises = new Map<
-    string,
-    { id: string; title: string; equipment: string | null; type: string | null }
-  >();
-  for (const p of data?.people || [])
-    for (const w of p.workouts as Workout[])
-      for (const e of w.exercises)
-        allExercises.set(e.exercise_template_id, {
-          id: e.exercise_template_id,
-          title: e.title,
-          equipment: e.equipment,
-          type: e.exercise_type,
-        });
-  const matching = [...allExercises.values()].filter(
-    (e) =>
-      e.equipment &&
-      e.type === "weight_reps" &&
-      groupReady &&
-      competitionPeople.every((p: any) =>
-        p.workouts.some((w: Workout) =>
-          w.exercises.some(
-            (x) =>
-              x.exercise_template_id === e.id &&
-              x.equipment === e.equipment &&
-              x.exercise_type === e.type,
-          ),
-        ),
-      ),
-  );
+  type LegacyExercise = {
+    id: string;
+    title: string;
+    equipment: string;
+    type: string;
+    matching: boolean;
+  };
+  const exerciseOptions: LegacyExercise[] = data?.exerciseOptions ?? [];
+  const allExercises = new Map(exerciseOptions.map((e) => [e.id, e]));
+  const matching = exerciseOptions.filter((e) => e.matching);
   const competition = data?.results[0],
     pending =
       data?.competitions.filter(
@@ -249,29 +486,6 @@ function App() {
       document.removeEventListener("visibilitychange", update);
     };
   }, [!!data, active, config?.googleAuth]);
-  const exerciseId =
-    selected || matching[0]?.id || allExercises.keys().next().value;
-  const chartMap = new Map<string, any>();
-  for (const p of data?.people || [])
-    for (const w of p.workouts as Workout[]) {
-      const day = localDay(w.start_time),
-        row = chartMap.get(day) || { day };
-      const sets = w.exercises
-        .filter((e) => e.exercise_template_id === exerciseId)
-        .flatMap((e) => e.sets)
-        .filter((s) => s.type !== "warmup" && s.weight_kg !== null);
-      if (sets.length) {
-        row[p.id] = Math.max(
-          row[p.id] || 0,
-          ...sets.map((s) => toDisplay(s.weight_kg!)),
-        );
-        row[p.id + " reps"] = Math.max(...sets.map((s) => s.reps || 0));
-        chartMap.set(day, row);
-      }
-    }
-  const chart = [...chartMap.values()].sort((a, b) =>
-    a.day.localeCompare(b.day),
-  );
   if (loading)
     return (
       <div className="loading">
@@ -454,11 +668,10 @@ function App() {
               </div>
             )
           )}
+          <InstallCard />
         </section>
       </main>
     );
-  const historyPerson =
-    data.people.find((p: any) => p.id === historyUser) || me;
   return (
     <div className="app-layout mobile-app">
       <header className="app-header">
@@ -479,13 +692,19 @@ function App() {
       <nav className="app-nav" aria-label="Main navigation">
         {navigation.map(({ screen, label, icon }) => {
           const current =
-            screen === tab || (screen === "Competition" && tab === "Compare");
+            screen === tab || (screen === "Compare" && tab === "Competition");
           return (
             <button
               key={screen}
               aria-current={current ? "page" : undefined}
               className={screen === "Train" ? "nav-train" : ""}
-              onClick={() => openTab(screen)}
+              onClick={() => {
+                if (screen === "Workouts") {
+                  setHistoryUser("");
+                  setExpanded("");
+                }
+                openTab(screen);
+              }}
             >
               <span className="nav-glyph">
                 <Icon name={icon} />
@@ -500,7 +719,7 @@ function App() {
           {pageTitles[tab] && (
             <div className="page-heading mobile-heading">
               <h1>{pageTitles[tab]}</h1>
-              {tab === "Workouts" && (
+              {tab === "Workouts" && data.companion && (
                 <button
                   className="outline"
                   disabled={busy || active}
@@ -556,244 +775,298 @@ function App() {
             </div>
           )}
           {tab === "Overview" && (
-            <Activity
-              name={data.me.name}
-              userId={data.me.id}
-              draft={draft}
-              people={data.people}
-              roster={roster}
-              openTrain={() => {
-                if (!draft) updateDraft(newDraft(unit));
-                openTab("Train");
-              }}
-              openCompetition={() => openTab("Competition")}
-              openHistory={(owner, workout) => {
-                setHistoryUser(owner ?? data.me.id);
-                setExpanded(workout ?? "");
-                openTab("Workouts");
-              }}
-            />
-          )}
-          {tab === "Train" && (
-            <Train
-              key={data.me.id}
-              draft={draft}
-              update={updateDraft}
-              busy={busy}
-              ownWorkouts={me.workouts}
-              exerciseOptions={[...allExercises.values()]}
-              start={(previous) => {
-                const next = newDraft(unit);
-                if (previous)
-                  next.exercises = repeatedExercises(previous, unit);
-                updateDraft(next);
-              }}
-              commit={async (log: LoggedWorkout) =>
-                act(async () => {
-                  await api("/app/workouts/log", log);
-                  updateDraft(null);
-                  openTab("Overview");
-                  setNotice("Workout saved.");
-                  await refresh();
-                })
-              }
-            />
-          )}
-          {tab === "Workouts" && (
-            <section className="card">
-              <div className="section-heading">
-                <h3>Workout history</h3>
-                <select
-                  aria-label="Participant"
-                  value={historyPerson.id}
-                  onChange={(e) => setHistoryUser(e.target.value)}
-                >
-                  {data.people.map((p: any) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              {historyPerson.workouts.length ? (
-                historyPerson.workouts.map((w: Workout) => (
-                  <article className="history-item" key={w.id}>
-                    <button
-                      className="history-toggle"
-                      aria-expanded={expanded === w.id}
-                      onClick={() => setExpanded(expanded === w.id ? "" : w.id)}
-                    >
-                      <span>
-                        <strong>
-                          {date(w.start_time)} ·{" "}
-                          {w.exercises
-                            .slice(0, 2)
-                            .map((e) => e.title)
-                            .join(" + ")}
-                        </strong>
-                        <small>
-                          {w.exercises.length} exercises ·{" "}
-                          {w.exercises.reduce((n, e) => n + e.sets.length, 0)}{" "}
-                          sets ·{" "}
-                          {isManualWorkout(w.id) ? "Logged in app" : "Hevy"}
-                        </small>
-                      </span>
-                      <span>{expanded === w.id ? "−" : "+"}</span>
-                    </button>
-                    {expanded === w.id &&
-                      w.exercises.map((e) => (
-                        <div className="exercise-detail" key={e.index}>
-                          <h4>
-                            {e.title}{" "}
-                            <small>
-                              {e.equipment || "Equipment unresolved"}
-                            </small>
-                          </h4>
-                          <table>
-                            <thead>
-                              <tr>
-                                <th>Set</th>
-                                <th>Type</th>
-                                <th>Weight ({unit})</th>
-                                <th>Reps</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {e.sets.map((s) => (
-                                <tr key={s.index}>
-                                  <td>{s.index + 1}</td>
-                                  <td>{s.type}</td>
-                                  <td>
-                                    {s.weight_kg === null
-                                      ? "—"
-                                      : toDisplay(s.weight_kg).toFixed(1)}
-                                  </td>
-                                  <td>{s.reps ?? "—"}</td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
-                      ))}
-                    {expanded === w.id &&
-                      historyPerson.id === accountId &&
-                      isManualWorkout(w.id) && (
-                        <div className="history-actions">
-                          {removeWorkout === w.id ? (
-                            <>
-                              <span>Remove this logged workout?</span>
-                              <button
-                                className="danger"
-                                disabled={busy}
-                                onClick={() =>
-                                  void act(async () => {
-                                    await api("/app/workouts/remove", {
-                                      id: w.id.slice(manualPrefix.length),
-                                    });
-                                    setRemoveWorkout("");
-                                    setExpanded("");
-                                    await refresh();
-                                  })
-                                }
-                              >
-                                Remove
-                              </button>
-                              <button
-                                className="text-button"
-                                onClick={() => setRemoveWorkout("")}
-                              >
-                                Cancel
-                              </button>
-                            </>
-                          ) : (
-                            <button
-                              className="text-button danger-text"
-                              onClick={() => setRemoveWorkout(w.id)}
-                            >
-                              Remove logged workout
-                            </button>
-                          )}
-                        </div>
-                      )}
-                  </article>
-                ))
-              ) : (
-                <Empty
-                  title="No workouts yet"
-                  text="Start a workout in Train or sync your Hevy history."
+            <>
+              <InstallCard />
+              <Activity
+                name={data.me.name}
+                userId={data.me.id}
+                draft={draft}
+                people={data.people}
+                roster={roster}
+                openRunImport={() => {
+                  setRunEntry(undefined);
+                  openTab("ImportRun");
+                }}
+                openTrain={() => {
+                  if (!draft)
+                    updateDraft(newDraft(unit, home.settings.distance));
+                  openTab("Train");
+                }}
+                openCompetition={() => openTab("Competition")}
+                openHistory={(owner, workout) => {
+                  setHistoryUser(owner ?? data.me.id);
+                  setExpanded(workout ?? "");
+                  openTab("Workouts");
+                }}
+              />
+              {recap && (
+                <Recap
+                  entry={recap}
+                  unit={unit}
+                  open={() => {
+                    setHistoryUser(accountId ?? "");
+                    setExpanded(recap.workout.id);
+                    openTab("Workouts");
+                  }}
                 />
               )}
-            </section>
+              {login.invite.startsWith("g.") && (
+                <section className="card workspace-form">
+                  <h3>Private group invitation</h3>
+                  <button
+                    className="outline"
+                    onClick={() =>
+                      void act(async () => {
+                        const result = await api("/auth/google/start", {
+                          invite: login.invite,
+                        });
+                        location.assign(result.url);
+                      })
+                    }
+                  >
+                    Join with Google
+                  </button>
+                </section>
+              )}
+              {pendingSaves.length > 0 && (
+                <section
+                  className="card workspace-form"
+                  aria-label="Pending workouts"
+                >
+                  <h3>Pending sync</h3>
+                  {pendingSaves.map((item) => (
+                    <div
+                      key={item.payload.mutationId}
+                      className="workspace-list-row"
+                    >
+                      <div>
+                        <strong>{item.payload.workout.title}</strong>
+                        <p className="muted">
+                          {item.error ?? "Waiting to send this workout."}
+                        </p>
+                      </div>
+                      <div className="workspace-actions">
+                        {item.conflict && (
+                          <button
+                            className="outline"
+                            onClick={() =>
+                              void act(async () => {
+                                if (!accountId) return;
+                                setPending(
+                                  await changePending(accountId, (items) =>
+                                    items.map((p) =>
+                                      p.payload.mutationId !==
+                                      item.payload.mutationId
+                                        ? p
+                                        : {
+                                            payload: {
+                                              ...p.payload,
+                                              id: crypto.randomUUID(),
+                                              mutationId: crypto.randomUUID(),
+                                              expectedRevision: 0,
+                                              routine: undefined,
+                                              exportToStrava: false,
+                                              workout: {
+                                                ...p.payload.workout,
+                                                audience: "private",
+                                                groupId: null,
+                                              },
+                                            },
+                                          },
+                                    ),
+                                  ),
+                                );
+                                await flushPending(accountId);
+                              })
+                            }
+                          >
+                            Save as separate workout
+                          </button>
+                        )}
+                        {item.error && (
+                          <button
+                            className="text-button"
+                            onClick={() =>
+                              void act(async () => {
+                                if (!accountId) return;
+                                setPending(
+                                  await changePending(accountId, (items) =>
+                                    items.filter(
+                                      (p) =>
+                                        p.payload.mutationId !==
+                                        item.payload.mutationId,
+                                    ),
+                                  ),
+                                );
+                                await refreshWorkspace();
+                              })
+                            }
+                          >
+                            {item.conflict
+                              ? "Use server version"
+                              : "Discard pending save"}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                  <button
+                    className="outline"
+                    onClick={() => {
+                      if (accountId) void flushPending(accountId);
+                    }}
+                  >
+                    Sync pending workouts
+                  </button>
+                </section>
+              )}
+              {accountId && (
+                <ActivityViews
+                  owner={accountId}
+                  unit={unit}
+                  home={home}
+                  revision={revision}
+                />
+              )}
+            </>
+          )}
+
+          {tab === "Train" &&
+            (draft ? (
+              <Session
+                key={draft.id + (draft.routineEditor ? "routine" : "workout")}
+                draft={draft}
+                change={updateDraft}
+                save={saveTraining}
+                saveRoutine={async (routine) => {
+                  await saveRoutine(routine);
+                  updateDraft(null);
+                }}
+                addCustom={async (item) => {
+                  await request("/catalog", item);
+                  setHome((current) => ({
+                    ...current,
+                    catalog: [...current.catalog, item],
+                  }));
+                }}
+                options={home.catalog}
+                history={trainingHistory}
+                settings={home.settings}
+                groups={home.groups}
+                busy={busy}
+                stravaConnected={!!strava?.connected}
+              />
+            ) : (
+              <TrainHome
+                home={home}
+                unit={unit}
+                history={trainingHistory}
+                start={startTraining}
+                repeat={(entry) =>
+                  startTraining(
+                    fromHistory(entry, unit, home.settings.distance, "repeat"),
+                  )
+                }
+                refresh={() => void refreshWorkspace()}
+              />
+            ))}
+          {tab === "Workouts" && accountId && (
+            <Progress
+              key={historyUser + "|" + expanded}
+              unit={unit}
+              home={home}
+              revision={revision}
+              owner={accountId}
+              initialOwner={historyUser}
+              initial={expanded}
+              changed={() => {
+                void refreshWorkspace();
+                void refresh();
+              }}
+              renderExtras={(entry) => (
+                <>
+                  {entry.details?.stravaRun && (
+                    <RunSplits run={entry.details.stravaRun} />
+                  )}
+                  <Attachments
+                    owner={entry.owner}
+                    current={accountId}
+                    workout={entry.workout.id}
+                  />
+                  <SharedActions entry={entry} owner={accountId} />
+                </>
+              )}
+              renderPhotos={(day) => (
+                <Attachments owner={accountId} current={accountId} day={day} />
+              )}
+              onAction={(entry, mode) => {
+                if (mode === "edit" && entry.details?.stravaRun) {
+                  setRunEntry(entry);
+                  openTab("ImportRun");
+                  return;
+                }
+                const next = fromHistory(
+                  entry,
+                  unit,
+                  home.settings.distance,
+                  mode === "duplicate" ? "edit" : mode,
+                );
+                if (mode === "duplicate") {
+                  const startedAt = new Date().toISOString();
+                  startTraining({
+                    ...next,
+                    id: crypto.randomUUID(),
+                    title: (next.title ?? "Workout") + " copy",
+                    startedAt,
+                    finishedAt: undefined,
+                    editRevision: undefined,
+                    note: undefined,
+                    gym: undefined,
+                    audience: "private",
+                    groupId: null,
+                  });
+                } else startTraining(next);
+              }}
+            />
+          )}
+          {tab === "ImportRun" && accountId && (
+            <ImportRun
+              key={accountId + ":" + (runEntry?.workout.id ?? "new")}
+              home={home}
+              initial={runEntry}
+              save={async (payload) => {
+                await request("/workouts/commit", payload);
+                setRunGroup(payload.workout.groupId ?? undefined);
+                openTab("Compare");
+                setNotice("Run shared with your competition group.");
+                void refreshWorkspace();
+              }}
+            />
           )}
           {tab === "Compare" && (
-            <section className="card">
-              <div className="section-heading">
-                <div>
-                  <p className="eyebrow">EXERCISE BY EXERCISE</p>
-                  <h3>Weight & repetitions over time</h3>
-                </div>
-                <select
-                  aria-label="Exercise"
-                  value={exerciseId || ""}
-                  onChange={(e) => setSelected(e.target.value)}
-                >
-                  <option value="" disabled>
-                    Choose an exercise
-                  </option>
-                  {[...allExercises.values()].map((e) => (
-                    <option key={e.id} value={e.id}>
-                      {e.title} · {e.equipment || "unknown"}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              {chart.length ? (
-                <>
-                  <Suspense fallback={<p className="muted">Loading chart…</p>}>
-                    <ProgressChart
-                      data={chart}
-                      people={data.people}
-                      unit={unit}
-                    />
-                  </Suspense>
-                  <p className="muted">
-                    Heaviest working-set weight per day ({unit}). Repetitions
-                    below are the highest working-set reps that day, not
-                    necessarily from the heaviest set.
-                  </p>
-                  <div className="table-scroll">
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>Date</th>
-                          {data.people.map((p: any) => (
-                            <th key={p.id}>{p.name} · reps</th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {chart.map((row) => (
-                          <tr key={row.day}>
-                            <td>{row.day}</td>
-                            {data.people.map((p: any) => (
-                              <td key={p.id}>{row[p.id + " reps"] ?? "—"}</td>
-                            ))}
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </>
-              ) : (
-                <Empty
-                  title="A clearer picture with every session"
-                  text="After your first sync, select an exercise to see its weight and repetition history."
+            <div className="train-stack">
+              <Compare home={home} unit={unit} revision={revision} />
+              {accountId && (
+                <CompetitionRuns
+                  home={home}
+                  owner={accountId}
+                  revision={revision}
+                  initialGroup={runGroup}
                 />
               )}
-            </section>
+              {accountId && <Challenges home={home} owner={accountId} />}
+            </div>
           )}
           {tab === "Competition" && (
             <>
+              {accountId && (
+                <CompetitionRuns
+                  home={home}
+                  owner={accountId}
+                  revision={revision}
+                  initialGroup={runGroup}
+                />
+              )}
               <section className="card">
                 <p className="eyebrow">THE SCOREBOARD</p>
                 <h3>Improvement from your first week</h3>
@@ -967,30 +1240,69 @@ function App() {
               </section>
             </>
           )}
+          {tab === "CloudflareCosts" && data.canViewCloudflareCosts && (
+            <>
+              <button
+                className="text-button"
+                onClick={() => openTab("Settings")}
+              >
+                Back to You
+              </button>
+              <CloudflareCosts />
+            </>
+          )}
           {tab === "Settings" && (
             <>
+              {data.canViewCloudflareCosts && (
+                <button
+                  className="secondary"
+                  onClick={() => openTab("CloudflareCosts")}
+                >
+                  Cloudflare costs
+                </button>
+              )}
+              {accountId && (
+                <AccountWorkspace
+                  key={accountId + home.settings.timezone}
+                  home={home}
+                  owner={accountId}
+                  unit={unit}
+                  refresh={() => void refreshWorkspace()}
+                  setDistanceUnit={(next) => {
+                    if (draft) updateDraft(changeDraftUnits(draft, unit, next));
+                  }}
+                  setWeightUnit={async (next) => {
+                    await api("/app/preferences", { unit: next });
+                    if (draft)
+                      updateDraft(
+                        changeDraftUnits(draft, next, home.settings.distance),
+                      );
+                    await refresh();
+                  }}
+                />
+              )}
+              <DataTools
+                changed={() => {
+                  void refreshWorkspace();
+                  void refresh();
+                }}
+              />
+              <Reconcile home={home} changed={() => void refreshWorkspace()} />
+              <PushPreferences />
+              <Integrations
+                status={strava}
+                refresh={() => void refreshWorkspace()}
+              />
               <InstallCard />
               <div className="two-column">
                 <section className="card">
                   <p className="eyebrow">YOUR PROFILE</p>
-                  <h3>Body weight & units</h3>
-                  <label>
-                    Display weights in
-                    <select
-                      value={unit}
-                      onChange={(e) =>
-                        void act(async () => {
-                          await api("/app/preferences", {
-                            unit: e.target.value,
-                          });
-                          await refresh();
-                        })
-                      }
-                    >
-                      <option value="lbs">Pounds (lbs)</option>
-                      <option value="kg">Kilograms (kg)</option>
-                    </select>
-                  </label>
+                  <h3>Original competition weigh-ins</h3>
+                  <p className="muted">
+                    Use Progress → Measurements for private weigh-ins. The
+                    values entered here are shared with players who have mutual
+                    sharing enabled for the original competition.
+                  </p>
                   <form
                     onSubmit={(e) => {
                       e.preventDefault();
@@ -1031,7 +1343,7 @@ function App() {
                       </label>
                     </div>
                     <button className="secondary" disabled={busy}>
-                      Save body weight
+                      Share weigh-in for original competition
                     </button>
                   </form>
                   <p className="fine-print">
@@ -1293,9 +1605,18 @@ function App() {
                   className="text-button"
                   onClick={() =>
                     void act(async () => {
+                      await unsubscribePush().catch(() => {});
                       await api("/app/logout", {});
+                      authVersion.current++;
+                      clearWorkspace();
+                      localStorage.removeItem("workout-offline-account");
                       setData(null);
                       setChallenge("");
+                      if (accountId)
+                        await Promise.allSettled([
+                          write(localKeys(accountId).home, null),
+                          write(localKeys(accountId).history, null),
+                        ]);
                     })
                   }
                 >

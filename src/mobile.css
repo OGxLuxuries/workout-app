@@ -652,6 +652,39 @@
   margin: 11px 0 0;
   font-size: 14px;
 }
+.install-platforms {
+  display: flex;
+  gap: 8px;
+}
+.install-platforms button[aria-pressed="true"] {
+  background: #203d32;
+  color: #fff;
+}
+.install-flow {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
+  gap: 14px;
+  padding-inline-start: 20px;
+  margin-block: 4px 10px;
+}
+.install-flow li {
+  padding-inline-start: 4px;
+}
+.install-screen {
+  display: grid;
+  gap: 8px;
+  margin-block-end: 6px;
+  padding: 12px;
+  border: 1px solid #bac9c1;
+  border-radius: 12px;
+  background: #f0f5f2;
+  color: #203d32;
+}
+.install-screen strong {
+  background: #fff;
+  border-radius: 6px;
+  padding: 8px;
+}
 
 .login-layout {
   background: #fff;

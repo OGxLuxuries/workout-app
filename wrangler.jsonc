@@ -17,7 +17,33 @@
     },
   ],
   "vars": { "APP_ORIGIN": "http://localhost:5173", "DEV_AUTH": "false" },
+  "r2_buckets": [{ "binding": "MEDIA", "bucket_name": "workout-media-local" }],
   "env": {
+    "staging": {
+      "name": "workout-competition-staging",
+      "account_id": "956c781e436e230d7acdfbed1fcb17ed",
+      "workers_dev": true,
+      "preview_urls": false,
+      "vars": {
+        "APP_ORIGIN": "https://workout-competition-staging.odgj61.workers.dev",
+        "DEV_AUTH": "false",
+        "AUTH_PROVIDER": "google",
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "workout-competition-staging",
+          "database_id": "8982763a-7328-44e0-b592-1d60c7a690fa",
+          "migrations_dir": "migrations",
+        },
+      ],
+      "r2_buckets": [
+        {
+          "binding": "MEDIA",
+          "bucket_name": "workout-competition-media-staging",
+        },
+      ],
+    },
     "production": {
       "name": "workout-competition",
       "account_id": "956c781e436e230d7acdfbed1fcb17ed",
@@ -31,6 +57,9 @@
         "DEV_AUTH": "false",
         "AUTH_PROVIDER": "google",
       },
+      "r2_buckets": [
+        { "binding": "MEDIA", "bucket_name": "workout-competition-media" },
+      ],
       "d1_databases": [
         {
           "binding": "DB",

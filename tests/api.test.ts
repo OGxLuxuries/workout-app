@@ -543,6 +543,516 @@ describe("account and sync flow with real local D1", () => {
     await call("/app/revoke-companion", {}, a);
     expect((await call("/companion/next", {}, "", ca)).status).toBe(401);
   });
+  it("preserves owner-only Hevy annotations and honors visibility in both history APIs", async () => {
+    const workout = sample("annotated");
+    const replaceWorkout = async (value: ReturnType<typeof sample>) => {
+      await DB.batch([
+        DB.prepare("DELETE FROM workouts WHERE user_id=? AND source_id=?").bind(
+          aid,
+          value.id,
+        ),
+        DB.prepare("INSERT INTO workouts VALUES(?,?,?,?,?)").bind(
+          aid,
+          value.id,
+          value.updated_at,
+          value.start_time,
+          JSON.stringify(value),
+        ),
+      ]);
+    };
+    await replaceWorkout(workout);
+    await call("/app/sharing", { partnerId: bid, consent: true }, a);
+    await call("/app/sharing", { partnerId: aid, consent: true }, b);
+    const annotation = {
+      id: workout.id,
+      title: "Local title",
+      note: "Owner only",
+      gym: "",
+      audience: "connections",
+    };
+    const path =
+      "/app/v2/workouts/item?" +
+      new URLSearchParams({ owner: aid, id: workout.id });
+    expect(
+      (await call("/app/v2/workouts/import-annotation", annotation, b)).status,
+    ).toBe(404);
+    expect(
+      (await call("/app/v2/workouts/import-annotation", annotation, a)).status,
+    ).toBe(200);
+    expect((await call(path, undefined, b)).body.annotation).toBeNull();
+    await replaceWorkout(sample(workout.id, 125, "2026-11-02T00:00:00Z"));
+    const imported = (await call(path, undefined, a)).body;
+    expect(imported.annotation.note).toBe(annotation.note);
+    expect(imported.workout.exercises[0].sets[0].weight_kg).toBe(125);
+    expect(
+      (
+        await call(
+          "/app/v2/workouts/import-annotation",
+          { ...annotation, audience: "private" },
+          a,
+        )
+      ).status,
+    ).toBe(200);
+    expect((await call(path, undefined, b)).status).toBe(404);
+    expect(
+      (await call("/app/dashboard", undefined, b)).body.people.find(
+        (person: { id: string }) => person.id === aid,
+      ).workouts,
+    ).toHaveLength(0);
+    await call("/app/delete-data", {}, a);
+    expect(
+      await DB.prepare(
+        "SELECT 1 FROM workout_import_annotations WHERE user_id=?",
+      )
+        .bind(aid)
+        .first(),
+    ).toBeNull();
+  });
+  it("keeps private native workouts out of peer reads and allows separate revocable metrics consent", async () => {
+    await call("/app/sharing", { partnerId: bid, consent: true }, a);
+    await call("/app/sharing", { partnerId: aid, consent: true }, b);
+    const library = await call("/app/v2/home", undefined, a);
+    expect(library.status).toBe(200);
+    const option = library.body.catalog.find(
+      (e: { id: string }) => e.id === "builtin:bench-press",
+    );
+    expect(option.title).toBe("Bench press");
+    const id = crypto.randomUUID(),
+      mutationId = crypto.randomUUID();
+    const payload = {
+      id,
+      mutationId,
+      expectedRevision: 0,
+      workout: {
+        title: "Private training fixture",
+        startedAt: "2020-03-01T18:00:00Z",
+        finishedAt: "2020-03-01T18:25:00Z",
+        audience: "private",
+        movements: [
+          {
+            ...option,
+            rowId: crypto.randomUUID(),
+            group: null,
+            restSeconds: 80,
+            sets: [
+              {
+                id: crypto.randomUUID(),
+                reps: 8,
+                weightKg: 20,
+                seconds: null,
+                meters: null,
+                warmup: false,
+              },
+            ],
+          },
+        ],
+      },
+    };
+    const saved = await call("/app/v2/workouts/commit", payload, a);
+    expect(saved.status).toBe(200);
+    expect(saved.body).toEqual({ id: "manual:" + id, revision: 1 });
+    expect((await call("/app/v2/workouts/commit", payload, a)).body).toEqual(
+      saved.body,
+    );
+    expect(
+      (
+        await call(
+          "/app/v2/workouts/commit",
+          { ...payload, workout: { ...payload.workout, title: "New title" } },
+          a,
+        )
+      ).status,
+    ).toBe(409);
+    const item =
+      "/app/v2/workouts/item?" +
+      new URLSearchParams({ owner: aid, id: saved.body.id });
+    expect((await call(item, undefined, a)).body.details.title).toBe(
+      payload.workout.title,
+    );
+    expect((await call(item, undefined, b)).status).toBe(404);
+    expect(
+      (await call("/app/dashboard", undefined, b)).body.people.find(
+        (p: { id: string }) => p.id === aid,
+      ).workouts,
+    ).toHaveLength(0);
+    const compare = "/app/v2/compare?scope=person&target=" + aid;
+    expect((await call(compare, undefined, b)).body.peer).toBeNull();
+    expect(
+      (
+        await call(
+          "/app/v2/groups/consent",
+          { scope: "person", targetId: bid, share: true },
+          a,
+        )
+      ).status,
+    ).toBe(200);
+    const report = await call(compare, undefined, b);
+    expect(report.status).toBe(200);
+    expect(report.body.peer.summary.volume).toBe(160);
+    expect((await call(item, undefined, b)).status).toBe(404);
+    expect(
+      (
+        await call(
+          "/app/v2/groups/consent",
+          { scope: "person", targetId: bid, share: false },
+          a,
+        )
+      ).status,
+    ).toBe(200);
+    expect((await call(compare, undefined, b)).body.peer).toBeNull();
+    expect(
+      (await call("/app/v2/compare?scope=group&target=original", undefined, a))
+        .body.median,
+    ).toBeNull();
+    const edited = await call(
+      "/app/v2/workouts/commit",
+      {
+        ...payload,
+        mutationId: crypto.randomUUID(),
+        expectedRevision: 1,
+        workout: { ...payload.workout, title: "Revised training fixture" },
+      },
+      a,
+    );
+    expect(edited.body.revision).toBe(2);
+    expect(
+      (
+        await call(
+          "/app/v2/workouts/commit",
+          { ...payload, mutationId: crypto.randomUUID(), expectedRevision: 1 },
+          a,
+        )
+      ).status,
+    ).toBe(409);
+    expect(
+      (
+        await call(
+          "/app/v2/workouts/delete",
+          { id, mutationId: crypto.randomUUID(), expectedRevision: 2 },
+          a,
+        )
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await call(
+          "/app/v2/workouts/commit",
+          { ...payload, mutationId: crypto.randomUUID() },
+          a,
+        )
+      ).status,
+    ).toBe(409);
+    expect((await call(item, undefined, a)).status).toBe(404);
+    await call("/app/sharing", { partnerId: bid, consent: false }, a);
+  });
+  it("suppresses medians below three peers and honors variant and group consent", async () => {
+    const variant = JSON.stringify([
+      "builtin:bench-press",
+      "barbell",
+      "weight_reps",
+    ]);
+    const compare =
+      "/app/v2/compare?" +
+      new URLSearchParams({
+        scope: "group",
+        target: "original",
+        variant,
+        start: "2020-11-01",
+        end: "2020-11-01",
+      });
+    const peers = [b, tashi, jason];
+    for (const [index, cookie] of peers.entries()) {
+      const saved = await call(
+        "/app/v2/workouts/commit",
+        {
+          id: crypto.randomUUID(),
+          mutationId: crypto.randomUUID(),
+          expectedRevision: 0,
+          workout: {
+            title: "Median fixture",
+            startedAt: "2020-11-02T03:30:00Z",
+            finishedAt: "2020-11-02T03:50:00Z",
+            movements: [
+              {
+                id: "builtin:bench-press",
+                title: "Bench press",
+                equipment: "barbell",
+                type: "weight_reps",
+                rowId: crypto.randomUUID(),
+                group: null,
+                restSeconds: null,
+                sets: [
+                  {
+                    id: crypto.randomUUID(),
+                    reps: 5,
+                    weightKg: (index + 1) * 20,
+                    seconds: null,
+                    meters: null,
+                    warmup: false,
+                  },
+                ],
+              },
+            ],
+          },
+        },
+        cookie,
+      );
+      expect(saved.status).toBe(200);
+      expect(
+        (
+          await call(
+            "/app/v2/groups/consent",
+            {
+              scope: "group",
+              targetId: "original",
+              share: true,
+              named: index === 0,
+            },
+            cookie,
+          )
+        ).status,
+      ).toBe(200);
+    }
+    const group = (await call(compare, undefined, a)).body;
+    expect(group.contributors).toBe(3);
+    expect(group.median.volume).toBe(200);
+    expect(group.named).toHaveLength(1);
+    expect(group.named[0].summary).not.toHaveProperty("days");
+    await call(
+      "/app/v2/groups/consent",
+      { scope: "group", targetId: "original", share: false },
+      jason,
+    );
+    const revoked = (await call(compare, undefined, a)).body;
+    expect(revoked.contributors).toBe(2);
+    expect(revoked.median).toBeNull();
+    expect(revoked.named).toHaveLength(1);
+    const differentEquipment = JSON.stringify([
+      "builtin:bench-press",
+      "dumbbell",
+      "weight_reps",
+    ]);
+    expect(
+      (
+        await call(
+          compare.replace(
+            encodeURIComponent(variant),
+            encodeURIComponent(differentEquipment),
+          ),
+          undefined,
+          a,
+        )
+      ).body.contributors,
+    ).toBe(0);
+  });
+  it("freezes competition sources and distinguishes a confirmed zero from incomplete import coverage", async () => {
+    const variant = JSON.stringify([
+      "builtin:bench-press",
+      "barbell",
+      "weight_reps",
+    ]);
+    const currentMonday = monday(localDay(new Date()));
+    const baseline = addDays(currentMonday, -21);
+    const week = addDays(baseline, 7);
+    const created = await call(
+      "/app/v2/challenges",
+      {
+        groupId: "original",
+        title: "Verification challenge",
+        start: addDays(currentMonday, 7),
+        players: [bid, jid],
+        variants: [variant],
+        source: "native",
+      },
+      b,
+    );
+    expect(created.status).toBe(200);
+    const id = created.body.id;
+    expect(
+      (await call("/app/v2/challenges/approve", { id, source: "mixed" }, jason))
+        .status,
+    ).toBe(200);
+    expect(
+      (
+        await call(
+          "/app/v2/challenges/approve",
+          { id, source: "native" },
+          jason,
+        )
+      ).status,
+    ).toBe(409);
+    await DB.prepare("UPDATE training_challenges SET starts_on=? WHERE id=?")
+      .bind(baseline, id)
+      .run();
+    for (const cookie of [b, jason]) {
+      expect(
+        (
+          await call(
+            "/app/v2/measurements",
+            { day: baseline, kind: "weight", value: 70 },
+            cookie,
+          )
+        ).status,
+      ).toBe(200);
+      const saved = await call(
+        "/app/v2/workouts/commit",
+        {
+          id: crypto.randomUUID(),
+          mutationId: crypto.randomUUID(),
+          expectedRevision: 0,
+          workout: {
+            title: "Baseline fixture",
+            startedAt: baseline + "T17:00:00Z",
+            finishedAt: baseline + "T18:00:00Z",
+            movements: [
+              {
+                id: "builtin:bench-press",
+                title: "Bench press",
+                equipment: "barbell",
+                type: "weight_reps",
+                rowId: crypto.randomUUID(),
+                group: null,
+                restSeconds: null,
+                sets: [
+                  {
+                    id: crypto.randomUUID(),
+                    reps: 10,
+                    weightKg: 70,
+                    seconds: null,
+                    meters: null,
+                    warmup: false,
+                  },
+                ],
+              },
+            ],
+          },
+        },
+        cookie,
+      );
+      expect(saved.status).toBe(200);
+      expect(
+        (
+          await call(
+            "/app/v2/challenges/confirm",
+            { id, week: baseline },
+            cookie,
+          )
+        ).status,
+      ).toBe(200);
+      expect(
+        (
+          await call(
+            "/app/v2/challenges/confirm",
+            { id, week: currentMonday },
+            cookie,
+          )
+        ).status,
+      ).toBe(400);
+    }
+    const scoreboard = async () =>
+      (
+        await call("/app/v2/challenges?week=" + week, undefined, b)
+      ).body.items.find((challenge: { id: string }) => challenge.id === id)
+        .standings;
+    const native = (standings: any[]) =>
+      standings.find((player) => player.userId === bid);
+    const mixed = (standings: any[]) =>
+      standings.find((player) => player.userId === jid);
+    expect(native(await scoreboard()).reason).toBe("Week not confirmed");
+    expect(
+      (await call("/app/v2/challenges/confirm", { id, week }, b)).status,
+    ).toBe(200);
+    expect(
+      (await call("/app/v2/challenges/confirm", { id, week }, jason)).status,
+    ).toBe(200);
+    const verified = await scoreboard();
+    expect(native(verified)).toMatchObject({
+      normalized: 0,
+      improvement: -100,
+      reason: null,
+    });
+    expect(mixed(verified)).toMatchObject({
+      improvement: null,
+      reason: "Baseline: Hevy coverage incomplete",
+    });
+  });
+  it("shows reviewed Strava splits only to members of the chosen competition group", async () => {
+    const id = crypto.randomUUID();
+    const run = {
+      unit: "mi",
+      paceSeconds: 770,
+      splits: [
+        { distance: 1, paceSeconds: 639 },
+        { distance: 1, paceSeconds: 936 },
+        { distance: 0.35, paceSeconds: 679 },
+      ],
+    };
+    const workout = {
+      title: "Shared Strava run",
+      startedAt: "2026-08-03T21:00:00Z",
+      finishedAt: "2026-08-03T21:30:12Z",
+      audience: "group",
+      groupId: "original",
+      stravaRun: run,
+      movements: [
+        {
+          id: "builtin:run",
+          title: "Run",
+          equipment: "other",
+          type: "distance",
+          muscle: "cardio",
+          rowId: crypto.randomUUID(),
+          group: null,
+          restSeconds: null,
+          sets: [
+            {
+              id: crypto.randomUUID(),
+              seconds: 1812,
+              meters: 3781.9584,
+              reps: null,
+              weightKg: null,
+              warmup: false,
+            },
+          ],
+        },
+      ],
+    };
+    expect(
+      (
+        await call(
+          "/app/v2/workouts/commit",
+          { id, mutationId: crypto.randomUUID(), expectedRevision: 0, workout },
+          a,
+        )
+      ).status,
+    ).toBe(200);
+    const feed = "/app/v2/workouts?runGroup=original";
+    expect(
+      (await call(feed, undefined, b)).body.items.find(
+        (entry: { workout: { id: string } }) =>
+          entry.workout.id === "manual:" + id,
+      ).details.stravaRun,
+    ).toEqual(run);
+    expect(
+      (await call("/app/v2/workouts?runGroup=unknown", undefined, b)).status,
+    ).toBe(404);
+    expect((await call(feed)).status).toBe(401);
+    expect(
+      (
+        await call(
+          "/app/v2/workouts/delete",
+          { id, mutationId: crypto.randomUUID(), expectedRevision: 1 },
+          a,
+        )
+      ).status,
+    ).toBe(200);
+    expect(
+      (await call(feed, undefined, b)).body.items.some(
+        (entry: { workout: { id: string } }) =>
+          entry.workout.id === "manual:" + id,
+      ),
+    ).toBe(false);
+  });
   it("rejects cross-site mutations and expired sessions", async () => {
     const r = await app.request(
       "http://localhost:8787/api/app/invite",
@@ -612,7 +1122,7 @@ describe("account and sync flow with real local D1", () => {
       AUTH_PROVIDER: "google",
       GOOGLE_CLIENT_ID: "fake-client.apps.googleusercontent.com",
       GOOGLE_CLIENT_SECRET: "test-only",
-      OLIVER_GOOGLE_EMAIL: "oliver@example.com",
+      OLIVER_GOOGLE_EMAIL: "odgj61@gmail.com",
     };
     const preserved = sample("w1");
     await DB.prepare(
@@ -722,7 +1232,7 @@ describe("account and sync flow with real local D1", () => {
       expect(wrongBrowser.headers.get("location")).toBe("/?signin=expired");
       const forged = await finish(
         await init(),
-        "oliver@example.com",
+        google.OLIVER_GOOGLE_EMAIL,
         "oliver-id",
         true,
         "another-app",
@@ -730,14 +1240,14 @@ describe("account and sync flow with real local D1", () => {
       expect(forged.headers.get("location")).toBe("/?signin=verification");
       const unverified = await finish(
         await init(),
-        "oliver@example.com",
+        google.OLIVER_GOOGLE_EMAIL,
         "oliver-id",
         false,
       );
       expect(unverified.headers.get("location")).toBe("/?signin=verification");
       const signed = await finish(
         attempt,
-        "OLIVER@example.com",
+        google.OLIVER_GOOGLE_EMAIL.toUpperCase(),
         "oliver-id",
         "true",
       );
@@ -750,20 +1260,46 @@ describe("account and sync flow with real local D1", () => {
         await call("/app/dashboard", undefined, session, "", google)
       ).body;
       expect(dash.me.id).toBe(aid);
+      const costs = "/app/v2/admin/costs";
+      const charge = {
+        month: "2026-11",
+        product: "Workers",
+        cents: 500,
+        note: "App share",
+      };
+      expect(dash.canViewCloudflareCosts).toBe(true);
+      expect((await call(costs, charge, session, "", google)).status).toBe(200);
+      expect(
+        (await call(costs, undefined, session, "", google)).body.entries[0],
+      ).toMatchObject(charge);
+      expect(
+        (
+          await call(
+            costs,
+            { ...charge, product: "Domain" },
+            session,
+            "",
+            google,
+          )
+        ).status,
+      ).toBe(400);
       expect(dash.people[0].workouts).toEqual([preserved]);
       expect(
         dash.roster.find((p: { name: string }) => p.name === "Blake").user_id,
       ).toBeNull();
       expect(
-        (await finish(attempt, "oliver@example.com", "oliver-id")).headers.get(
-          "location",
-        ),
+        (
+          await finish(attempt, google.OLIVER_GOOGLE_EMAIL, "oliver-id")
+        ).headers.get("location"),
       ).toBe("/?signin=expired");
       expect(
         (
           await finish(await init(), "new-email@example.com", "oliver-id")
         ).headers.get("location"),
       ).toBe("/");
+      expect((await call(costs, undefined, session, "", google)).status).toBe(
+        403,
+      );
       const invitation = await call(
         "/app/invite",
         { playerName: "Blake", googleEmail: "blake@example.com" },
@@ -789,6 +1325,12 @@ describe("account and sync flow with real local D1", () => {
         .find((c) => c.startsWith("wc_session="))!
         .split(";")[0];
       expect(
+        (await call(costs, undefined, blakeCookie, "", google)).status,
+      ).toBe(403);
+      expect((await call(costs, charge, blakeCookie, "", google)).status).toBe(
+        403,
+      );
+      expect(
         (await call("/app/dashboard", undefined, blakeCookie, "", google)).body
           .me.id,
       ).toBe(bid);
@@ -803,6 +1345,50 @@ describe("account and sync flow with real local D1", () => {
           )
         ).status,
       ).toBe(403);
+      const group = await call(
+        "/app/v2/groups",
+        { name: "Private test group", timezone: "America/New_York" },
+        session,
+        "",
+        google,
+      );
+      expect(group.status).toBe(200);
+      const groupInvite = await call(
+        "/app/v2/groups/invite",
+        { groupId: group.body.id, email: "member@example.com" },
+        session,
+        "",
+        google,
+      );
+      expect(groupInvite.status).toBe(200);
+      const groupCode = new URL(groupInvite.body.url).searchParams.get(
+        "groupInvite",
+      );
+      expect(
+        (
+          await finish(
+            await init("g." + groupCode),
+            "wrong@example.com",
+            "other-user",
+          )
+        ).headers.get("location"),
+      ).toBe("/?signin=invitation");
+      const joined = await finish(
+        await init("g." + groupCode),
+        "member@example.com",
+        "new-member",
+      );
+      expect(joined.headers.get("location")).toBe("/");
+      const memberCookie = joined.headers
+        .getSetCookie()
+        .find((s) => s.startsWith("wc_session="))!
+        .split(";")[0];
+      const current = (
+        await call("/app/v2/home", undefined, memberCookie, "", google)
+      ).body;
+      expect(current.groups.map((item: { id: string }) => item.id)).toContain(
+        group.body.id,
+      );
       expect(
         (
           await call(
