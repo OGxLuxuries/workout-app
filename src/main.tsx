@@ -114,6 +114,22 @@ const navigation = [
   { screen: "Compare", label: "Compare", icon: "compete" },
   { screen: "Settings", label: "You", icon: "profile" },
 ] as const;
+const tabPaths: Record<string, string> = {
+  Overview: "today",
+  Train: "train",
+  Workouts: "progress",
+  Compare: "compare",
+  Competition: "standings",
+  Settings: "you",
+  ImportRun: "import-run",
+  CloudflareCosts: "costs",
+};
+function tabFromHash() {
+  const path = decodeURIComponent(location.hash.slice(1));
+  return (
+    Object.keys(tabPaths).find((tab) => tabPaths[tab] === path) ?? "Overview"
+  );
+}
 const pageTitles: Record<string, string> = {
   Workouts: "Progress",
   Competition: "Competition",
@@ -124,7 +140,7 @@ const pageTitles: Record<string, string> = {
 function App() {
   const [data, setData] = useState<any>(null),
     [config, setConfig] = useState<LoginConfig | null>(null),
-    [tab, setTab] = useState("Overview"),
+    [tab, setTab] = useState(tabFromHash),
     [error, setError] = useState(
       () =>
         signInErrors[
@@ -181,6 +197,20 @@ function App() {
   activeOwner.current = accountId;
   const draft =
     localDraft?.owner === accountId ? (localDraft?.value ?? null) : null;
+  useEffect(() => {
+    if (tabFromHash() === tab) return;
+    const hash = tab === "Overview" ? "" : "#" + tabPaths[tab];
+    history.pushState(null, "", location.pathname + location.search + hash);
+  }, [tab]);
+  useEffect(() => {
+    const follow = () => {
+      setTab(tabFromHash());
+      setError("");
+      setNotice("");
+    };
+    window.addEventListener("popstate", follow);
+    return () => window.removeEventListener("popstate", follow);
+  }, []);
   useEffect(() => {
     if (!accountId) return;
     const owner = accountId;
@@ -1116,7 +1146,7 @@ function App() {
                 ) : (
                   <Empty
                     title="Your next challenge is waiting"
-                    text="Have all four players sync their workouts, agree on matching exercises, and choose a Monday to start."
+                    text="Have every player sync their workouts, agree on matching exercises, and choose a Monday to start."
                   />
                 )}
               </section>
@@ -1196,8 +1226,8 @@ function App() {
                       />
                     </label>
                     <p className="muted">
-                      Choose exercise variants present in all four workout
-                      histories.
+                      Choose exercise variants present in every player’s workout
+                      history.
                     </p>
                     {matching.length ? (
                       matching.map((e) => (
@@ -1218,8 +1248,8 @@ function App() {
                       ))
                     ) : (
                       <p>
-                        No matching weighted exercise variants yet. Have all
-                        four players sync their workouts.
+                        No matching weighted exercise variants yet. Have every
+                        player sync their workouts.
                       </p>
                     )}
                     <button
@@ -1233,7 +1263,7 @@ function App() {
                   </form>
                 ) : (
                   <p className="muted">
-                    All four players must join. Set up mutual sharing with each
+                    Every player must join. Set up mutual sharing with each
                     player to propose the rules.
                   </p>
                 )}
@@ -1471,7 +1501,7 @@ function App() {
                       Oliver manages invitations for the remaining players.
                     </p>
                   ) : (
-                    <p className="muted">All four players have joined.</p>
+                    <p className="muted">All players have joined.</p>
                   )}
                 </section>
               </div>

@@ -264,7 +264,7 @@ export function Activity({
         <div className="week-bars">
           {weekly.map((p, i) => (
             <div className="week-row" key={p.name}>
-              <span className={`roster-avatar roster-${i % 4}`}>
+              <span className={`roster-avatar roster-${i % 5}`}>
                 {p.name[0]}
               </span>
               <strong>{p.user_id === userId ? "You" : p.name}</strong>

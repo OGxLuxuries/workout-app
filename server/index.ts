@@ -1009,7 +1009,7 @@ app.post("/api/app/competition", async (c) => {
   const members = slots.flatMap((p) => (p.user_id ? [p.user_id] : []));
   const id = c.get("user").id;
   if (members.length !== slots.length || !members.includes(id))
-    fail("All four players must join before proposing a competition.", 409);
+    fail("Every player must join before proposing a competition.", 409);
   if (!canViewPlayers(c, members, await playerSharing(c)))
     fail("Set up mutual sharing with every player first.", 403);
   if (monday(startDay) !== startDay || startDay <= localDay(new Date()))
@@ -1037,7 +1037,7 @@ app.post("/api/app/competition", async (c) => {
         ),
     )
   )
-    fail("Choose exercise variants present in all four workout histories.");
+    fail("Choose exercise variants present in every player’s workout history.");
   const competitionId = crypto.randomUUID();
   await db(c).batch([
     db(c)

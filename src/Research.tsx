@@ -48,10 +48,19 @@ export function useResource<T>(url: string | null, revision = 0) {
   return state.key === url ? state : { key: url, value: null, error: "" };
 }
 
-const amount = (value: number) =>
-  new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(value);
-const weight = (kg: number, unit: string) =>
-  amount(kg / (unit === "lbs" ? 0.45359237 : 1)) + " " + unit;
+const amount = (value: number, digits = 2) =>
+  new Intl.NumberFormat(undefined, { maximumFractionDigits: digits }).format(
+    value,
+  );
+// Pounds are converted from stored kilograms, so extra decimals are noise.
+const weight = (kg: number, unit: string, digits = unit === "lbs" ? 1 : 2) =>
+  amount(kg / (unit === "lbs" ? 0.45359237 : 1), digits) + " " + unit;
+const duration = (seconds: number) => {
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return minutes + " min";
+  const rest = minutes % 60;
+  return Math.floor(minutes / 60) + " h" + (rest ? " " + rest + " min" : "");
+};
 const initialDay = (timezone: string) => trainingDay(new Date(), timezone);
 const dayLabel = (at: string, timeZone?: string) =>
   new Date(at).toLocaleDateString(undefined, {
@@ -91,9 +100,10 @@ function valueFor(
   unit: string,
   distanceUnit: string,
 ) {
-  if (metric === "volume" || metric === "top") return weight(value, unit);
+  if (metric === "volume") return weight(value, unit, 0);
+  if (metric === "top") return weight(value, unit);
   if (metric === "seconds" || metric === "activeSeconds")
-    return amount(value / 60) + " min";
+    return duration(value);
   if (metric === "distance")
     return (
       amount(value / (distanceUnit === "mi" ? 1609.344 : 1000)) +
@@ -1129,7 +1139,7 @@ export function Compare({
               .sort((a, b) => b.summary.volume - a.summary.volume)
               .map((p, i) => (
                 <li key={p.name + i}>
-                  {p.name} · {weight(p.summary.volume, unit)}
+                  {p.name} · {weight(p.summary.volume, unit, 0)}
                 </li>
               ))}
           </ol>

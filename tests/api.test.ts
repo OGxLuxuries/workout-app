@@ -71,8 +71,10 @@ let a = "",
   cb = "";
 let tashi = "",
   jason = "",
+  enzo = "",
   tid = "",
-  jid = "";
+  jid = "",
+  eid = "";
 async function signup(name: string, phone: string, invite: string) {
   const start = await call("/auth/start", { name, phone, invite });
   expect(start.status).toBe(200);
@@ -444,6 +446,7 @@ describe("account and sync flow with real local D1", () => {
       "Tashi",
       "Jason",
       "Blake",
+      "Enzo",
     ]);
     expect(t.sharing).toHaveLength(3);
     expect(j.sharing).toHaveLength(3);
@@ -453,12 +456,22 @@ describe("account and sync flow with real local D1", () => {
       (await call("/app/invite", { playerName: "Fifth player" }, a)).status,
     ).toBe(409);
   });
-  it("requires a variant shared by all four players and records each approval independently", async () => {
+  it("requires a variant shared by every player and records each approval independently", async () => {
+    const exercise = { id: "bench", equipment: "barbell", type: "weight_reps" };
+    const nextMonday = addDays(monday(localDay(new Date())), 7);
+    const proposal = { startDay: nextMonday, choices: [exercise] };
+    expect((await call("/app/competition", proposal, a)).status).toBe(409);
+    const enzoInvite = new URL(
+      (await call("/app/invite", { playerName: "Enzo" }, a)).body.url,
+    ).searchParams.get("invite")!;
+    enzo = await signup("Enzo", "+15550000006", enzoInvite);
+    eid = (await call("/app/dashboard", undefined, enzo)).body.me.id;
     const players = [
       { id: aid, cookie: a },
       { id: bid, cookie: b },
       { id: tid, cookie: tashi },
       { id: jid, cookie: jason },
+      { id: eid, cookie: enzo },
     ];
     for (const player of players)
       for (const other of players)
@@ -473,9 +486,6 @@ describe("account and sync flow with real local D1", () => {
             ).status,
           ).toBe(200);
         }
-    const exercise = { id: "bench", equipment: "barbell", type: "weight_reps" };
-    const nextMonday = addDays(monday(localDay(new Date())), 7);
-    const proposal = { startDay: nextMonday, choices: [exercise] };
     expect((await call("/app/competition", proposal, a)).status).toBe(400);
     for (const player of players.slice(1)) {
       const fixture = sample("group-bench");
@@ -509,24 +519,25 @@ describe("account and sync flow with real local D1", () => {
       "Tashi",
       "Jason",
       "Blake",
+      "Enzo",
     ]);
     expect(competition.members.filter((m: any) => m.approved)).toHaveLength(1);
     const approve = `/app/competition/${competition.id}/approve`;
-    for (const player of [b, tashi])
+    for (const player of [b, tashi, enzo])
       expect((await call(approve, {}, player)).status).toBe(200);
     expect((await dashboard(a)).results).toHaveLength(0);
     expect((await call(approve, {}, jason)).status).toBe(200);
     for (const player of players)
       expect((await dashboard(player.cookie)).results[0].results).toHaveLength(
-        4,
+        5,
       );
     await call("/app/sharing", { partnerId: jid, consent: false }, tashi);
     const j = await dashboard(jason);
-    expect(j.people).toHaveLength(3);
+    expect(j.people).toHaveLength(4);
     expect(j.results).toHaveLength(0);
-    expect((await dashboard(a)).results[0].results).toHaveLength(4);
+    expect((await dashboard(a)).results[0].results).toHaveLength(5);
     // Restore the two-account privacy setup used by the remaining sync tests.
-    for (const extra of [tid, jid])
+    for (const extra of [tid, jid, eid])
       await call("/app/sharing", { partnerId: extra, consent: false }, b);
   });
   it("revokes sharing immediately and deletion prevents a running import from restoring data", async () => {

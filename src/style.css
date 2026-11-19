@@ -838,12 +838,16 @@ footer span {
 }
 .login-panel {
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
+  gap: 28px;
   padding: 60px 40px;
+  min-width: 0;
 }
 .login-panel form,
-.google-login {
+.google-login,
+.login-panel .install-card {
   max-width: 360px;
   width: 100%;
 }
