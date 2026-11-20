@@ -164,11 +164,31 @@
   height: 44px;
 }
 .app-nav {
+  position: sticky;
+  top: 0;
+  z-index: 4;
   display: flex;
   justify-content: center;
   gap: 10px;
   background: #fff;
   border-bottom: 1px solid var(--line);
+}
+.page-section {
+  scroll-margin-top: 68px;
+}
+.page-section + .page-section {
+  margin-top: 44px;
+  padding-top: 36px;
+  border-top: 1px solid var(--line);
+}
+.page-section > .mobile-heading {
+  display: flex;
+  justify-content: space-between;
+}
+.page-section > .mobile-heading h2 {
+  font-size: 32px;
+  letter-spacing: -1px;
+  margin: 0;
 }
 .app-nav button {
   display: flex;
@@ -788,8 +808,16 @@
     margin: 4px 0 13px;
     gap: 8px;
   }
-  .mobile-heading h1 {
+  .mobile-heading h1,
+  .page-section > .mobile-heading h2 {
     font-size: 29px;
+  }
+  .page-section {
+    scroll-margin-top: 12px;
+  }
+  .page-section + .page-section {
+    margin-top: 32px;
+    padding-top: 28px;
   }
   .feed-metrics {
     gap: 12px;

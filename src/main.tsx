@@ -1,10 +1,9 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { localDay, monday, addDays, rankPlayers } from "../shared/scoring";
 import { allTimeStart } from "../shared/sync";
 import { Activity, Icon, InstallCard } from "./workout-ui";
 import { CompetitionRuns, ImportRun, RunSplits } from "./ImportRun";
-import { CloudflareCosts } from "./CloudflareCosts";
 import {
   Session,
   changeDraftUnits,
@@ -122,7 +121,6 @@ const tabPaths: Record<string, string> = {
   Competition: "standings",
   Settings: "you",
   ImportRun: "import-run",
-  CloudflareCosts: "costs",
 };
 function tabFromHash() {
   const path = decodeURIComponent(location.hash.slice(1));
@@ -130,17 +128,41 @@ function tabFromHash() {
     Object.keys(tabPaths).find((tab) => tabPaths[tab] === path) ?? "Overview"
   );
 }
-const pageTitles: Record<string, string> = {
-  Workouts: "Progress",
-  Competition: "Competition",
-  Compare: "Compare",
-  Settings: "Your account",
-  ImportRun: "Import run",
-};
+function PageSection({
+  id,
+  title,
+  action,
+  children,
+}: {
+  id: string;
+  title?: string;
+  action?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <section
+      className="page-section"
+      id={id}
+      aria-labelledby={title ? id + "-title" : undefined}
+    >
+      {title && (
+        <div className="page-heading mobile-heading">
+          <h2 id={id + "-title"}>{title}</h2>
+          {action}
+        </div>
+      )}
+      {children}
+    </section>
+  );
+}
 function App() {
   const [data, setData] = useState<any>(null),
     [config, setConfig] = useState<LoginConfig | null>(null),
     [tab, setTab] = useState(tabFromHash),
+    [jump, setJump] = useState<{ screen: string; n: number } | null>(() =>
+      location.hash ? { screen: tabFromHash(), n: 0 } : null,
+    ),
+    [importing, setImporting] = useState(false),
     [error, setError] = useState(
       () =>
         signInErrors[
@@ -197,20 +219,45 @@ function App() {
   activeOwner.current = accountId;
   const draft =
     localDraft?.owner === accountId ? (localDraft?.value ?? null) : null;
+  // Scroll to a section after it has rendered.
   useEffect(() => {
-    if (tabFromHash() === tab) return;
-    const hash = tab === "Overview" ? "" : "#" + tabPaths[tab];
-    history.pushState(null, "", location.pathname + location.search + hash);
-  }, [tab]);
+    if (!jump || !data) return;
+    const frame = requestAnimationFrame(() => {
+      document.getElementById(tabPaths[jump.screen])?.scrollIntoView({
+        behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+          ? "auto"
+          : "smooth",
+        block: "start",
+      });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [jump, data]);
+  // Highlight the section being read and keep the address in step with it.
   useEffect(() => {
-    const follow = () => {
-      setTab(tabFromHash());
-      setError("");
-      setNotice("");
-    };
-    window.addEventListener("popstate", follow);
-    return () => window.removeEventListener("popstate", follow);
-  }, []);
+    if (!data) return;
+    const sections = Object.entries(tabPaths)
+      .map(([screen, id]) => ({ screen, el: document.getElementById(id) }))
+      .filter((x): x is { screen: string; el: HTMLElement } => !!x.el);
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const hit = entries.find((entry) => entry.isIntersecting);
+        const match = hit && sections.find((x) => x.el === hit.target);
+        if (!match) return;
+        setTab(match.screen);
+        const hash =
+          match.screen === "Overview" ? "" : "#" + tabPaths[match.screen];
+        if (location.hash !== hash)
+          history.replaceState(
+            null,
+            "",
+            location.pathname + location.search + hash,
+          );
+      },
+      { rootMargin: "-35% 0px -60% 0px" },
+    );
+    sections.forEach((x) => observer.observe(x.el));
+    return () => observer.disconnect();
+  }, [data, importing, !!draft]);
   useEffect(() => {
     if (!accountId) return;
     const owner = accountId;
@@ -222,13 +269,13 @@ function App() {
             ? current
             : { owner, value: saved ? normalizeDraft(saved) : null },
         );
-        if (saved) setTab("Train");
+        if (saved) openTab("Train");
       })
       .catch(() => {});
     void refreshWorkspace(owner);
     const search = new URLSearchParams(location.search);
     if (search.get("strava")) {
-      setTab("Settings");
+      openTab("Settings");
       setNotice(
         search.get("strava") === "connected"
           ? "Strava connected."
@@ -237,7 +284,7 @@ function App() {
     } else if (search.get("workout")) {
       setHistoryUser(search.get("owner") ?? owner);
       setExpanded(search.get("workout")!);
-      setTab("Workouts");
+      openTab("Workouts");
     }
     void flushPending(owner);
     const online = () => void flushPending(owner);
@@ -381,10 +428,10 @@ function App() {
     openTab("Train");
   }
   function openTab(screen: string) {
-    setTab(screen);
+    if (screen === "ImportRun") setImporting(true);
+    setJump((current) => ({ screen, n: (current?.n ?? 0) + 1 }));
     setError("");
     setNotice("");
-    window.scrollTo(0, 0);
   }
   function clearWorkspace() {
     activeOwner.current = undefined;
@@ -702,6 +749,26 @@ function App() {
         </section>
       </main>
     );
+  const syncButton = data?.companion ? (
+    <button
+      className="outline"
+      disabled={busy || active}
+      onClick={() =>
+        void act(async () => {
+          await api("/app/sync", {});
+          setNotice(
+            "Sync requested. Your local Codex companion will read Hevy.",
+          );
+          await refresh();
+        })
+      }
+    >
+      <span className={active ? "spin" : ""}>
+        <Icon name="sync" size={17} />
+      </span>
+      {active ? "Syncing" : "Sync workouts"}
+    </button>
+  ) : undefined;
   return (
     <div className="app-layout mobile-app">
       <header className="app-header">
@@ -746,47 +813,6 @@ function App() {
       </nav>
       <main className="main">
         <div className="page">
-          {pageTitles[tab] && (
-            <div className="page-heading mobile-heading">
-              <h1>{pageTitles[tab]}</h1>
-              {tab === "Workouts" && data.companion && (
-                <button
-                  className="outline"
-                  disabled={busy || active}
-                  onClick={() =>
-                    void act(async () => {
-                      await api("/app/sync", {});
-                      setNotice(
-                        "Sync requested. Your local Codex companion will read Hevy.",
-                      );
-                      await refresh();
-                    })
-                  }
-                >
-                  <span className={active ? "spin" : ""}>
-                    <Icon name="sync" size={17} />
-                  </span>
-                  {active ? "Syncing" : "Sync workouts"}
-                </button>
-              )}
-            </div>
-          )}
-          {(tab === "Competition" || tab === "Compare") && (
-            <nav className="segment" aria-label="Competition views">
-              <button
-                aria-current={tab === "Competition" ? "page" : undefined}
-                onClick={() => openTab("Competition")}
-              >
-                Standings
-              </button>
-              <button
-                aria-current={tab === "Compare" ? "page" : undefined}
-                onClick={() => openTab("Compare")}
-              >
-                Exercises
-              </button>
-            </nav>
-          )}
           {config?.devAuth && (
             <div className="alert">
               LOCAL TEST MODE · Accounts and SMS verification are simulated.
@@ -804,7 +830,7 @@ function App() {
               {notice}
             </div>
           )}
-          {tab === "Overview" && (
+          <PageSection id={tabPaths.Overview}>
             <>
               <InstallCard />
               <Activity
@@ -959,10 +985,9 @@ function App() {
                 />
               )}
             </>
-          )}
-
-          {tab === "Train" &&
-            (draft ? (
+          </PageSection>
+          <PageSection id={tabPaths.Train} title="Train">
+            {draft ? (
               <Session
                 key={draft.id + (draft.routineEditor ? "routine" : "workout")}
                 draft={draft}
@@ -999,81 +1024,110 @@ function App() {
                 }
                 refresh={() => void refreshWorkspace()}
               />
-            ))}
-          {tab === "Workouts" && accountId && (
-            <Progress
-              key={historyUser + "|" + expanded}
-              unit={unit}
-              home={home}
-              revision={revision}
-              owner={accountId}
-              initialOwner={historyUser}
-              initial={expanded}
-              changed={() => {
-                void refreshWorkspace();
-                void refresh();
-              }}
-              renderExtras={(entry) => (
-                <>
-                  {entry.details?.stravaRun && (
-                    <RunSplits run={entry.details.stravaRun} />
-                  )}
+            )}
+          </PageSection>
+          {accountId && (
+            <PageSection
+              id={tabPaths.Workouts}
+              title="Progress"
+              action={syncButton}
+            >
+              <Progress
+                key={historyUser + "|" + expanded}
+                unit={unit}
+                home={home}
+                revision={revision}
+                owner={accountId}
+                initialOwner={historyUser}
+                initial={expanded}
+                changed={() => {
+                  void refreshWorkspace();
+                  void refresh();
+                }}
+                renderExtras={(entry) => (
+                  <>
+                    {entry.details?.stravaRun && (
+                      <RunSplits run={entry.details.stravaRun} />
+                    )}
+                    <Attachments
+                      owner={entry.owner}
+                      current={accountId}
+                      workout={entry.workout.id}
+                    />
+                    <SharedActions entry={entry} owner={accountId} />
+                  </>
+                )}
+                renderPhotos={(day) => (
                   <Attachments
-                    owner={entry.owner}
+                    owner={accountId}
                     current={accountId}
-                    workout={entry.workout.id}
+                    day={day}
                   />
-                  <SharedActions entry={entry} owner={accountId} />
-                </>
-              )}
-              renderPhotos={(day) => (
-                <Attachments owner={accountId} current={accountId} day={day} />
-              )}
-              onAction={(entry, mode) => {
-                if (mode === "edit" && entry.details?.stravaRun) {
-                  setRunEntry(entry);
-                  openTab("ImportRun");
-                  return;
-                }
-                const next = fromHistory(
-                  entry,
-                  unit,
-                  home.settings.distance,
-                  mode === "duplicate" ? "edit" : mode,
-                );
-                if (mode === "duplicate") {
-                  const startedAt = new Date().toISOString();
-                  startTraining({
-                    ...next,
-                    id: crypto.randomUUID(),
-                    title: (next.title ?? "Workout") + " copy",
-                    startedAt,
-                    finishedAt: undefined,
-                    editRevision: undefined,
-                    note: undefined,
-                    gym: undefined,
-                    audience: "private",
-                    groupId: null,
-                  });
-                } else startTraining(next);
-              }}
-            />
+                )}
+                onAction={(entry, mode) => {
+                  if (mode === "edit" && entry.details?.stravaRun) {
+                    setRunEntry(entry);
+                    openTab("ImportRun");
+                    return;
+                  }
+                  const next = fromHistory(
+                    entry,
+                    unit,
+                    home.settings.distance,
+                    mode === "duplicate" ? "edit" : mode,
+                  );
+                  if (mode === "duplicate") {
+                    const startedAt = new Date().toISOString();
+                    startTraining({
+                      ...next,
+                      id: crypto.randomUUID(),
+                      title: (next.title ?? "Workout") + " copy",
+                      startedAt,
+                      finishedAt: undefined,
+                      editRevision: undefined,
+                      note: undefined,
+                      gym: undefined,
+                      audience: "private",
+                      groupId: null,
+                    });
+                  } else startTraining(next);
+                }}
+              />
+            </PageSection>
           )}
-          {tab === "ImportRun" && accountId && (
-            <ImportRun
-              key={accountId + ":" + (runEntry?.workout.id ?? "new")}
-              home={home}
-              initial={runEntry}
-              save={async (payload) => {
-                await request("/workouts/commit", payload);
-                setRunGroup(payload.workout.groupId ?? undefined);
-                openTab("Compare");
-                setNotice("Run shared with your competition group.");
-                void refreshWorkspace();
-              }}
-            />
+          {importing && accountId && (
+            <PageSection
+              id={tabPaths.ImportRun}
+              title="Import run"
+              action={
+                <button
+                  className="text-button"
+                  onClick={() => {
+                    setImporting(false);
+                    setRunEntry(undefined);
+                  }}
+                >
+                  Close
+                </button>
+              }
+            >
+              <ImportRun
+                key={accountId + ":" + (runEntry?.workout.id ?? "new")}
+                home={home}
+                initial={runEntry}
+                save={async (payload) => {
+                  await request("/workouts/commit", payload);
+                  setRunGroup(payload.workout.groupId ?? undefined);
+                  setImporting(false);
+                  setRunEntry(undefined);
+                  openTab("Compare");
+                  setNotice("Run shared with your competition group.");
+                  void refreshWorkspace();
+                }}
+              />
+            </PageSection>
           )}
-          {tab === "Compare" && (
+          <PageSection id={tabPaths.Compare} title="Compare">
             <div className="train-stack">
               <Compare home={home} unit={unit} revision={revision} />
               {accountId && (
@@ -1086,17 +1140,9 @@ function App() {
               )}
               {accountId && <Challenges home={home} owner={accountId} />}
             </div>
-          )}
-          {tab === "Competition" && (
+          </PageSection>
+          <PageSection id={tabPaths.Competition} title="Standings">
             <>
-              {accountId && (
-                <CompetitionRuns
-                  home={home}
-                  owner={accountId}
-                  revision={revision}
-                  initialGroup={runGroup}
-                />
-              )}
               <section className="card">
                 <p className="eyebrow">THE SCOREBOARD</p>
                 <h3>Improvement from your first week</h3>
@@ -1269,28 +1315,9 @@ function App() {
                 )}
               </section>
             </>
-          )}
-          {tab === "CloudflareCosts" && data.canViewCloudflareCosts && (
+          </PageSection>
+          <PageSection id={tabPaths.Settings} title="Your account">
             <>
-              <button
-                className="text-button"
-                onClick={() => openTab("Settings")}
-              >
-                Back to You
-              </button>
-              <CloudflareCosts />
-            </>
-          )}
-          {tab === "Settings" && (
-            <>
-              {data.canViewCloudflareCosts && (
-                <button
-                  className="secondary"
-                  onClick={() => openTab("CloudflareCosts")}
-                >
-                  Cloudflare costs
-                </button>
-              )}
               {accountId && (
                 <AccountWorkspace
                   key={accountId + home.settings.timezone}
@@ -1323,7 +1350,6 @@ function App() {
                 status={strava}
                 refresh={() => void refreshWorkspace()}
               />
-              <InstallCard />
               <div className="two-column">
                 <section className="card">
                   <p className="eyebrow">YOUR PROFILE</p>
@@ -1654,7 +1680,7 @@ function App() {
                 </button>
               </section>
             </>
-          )}
+          </PageSection>
         </div>
       </main>
     </div>
