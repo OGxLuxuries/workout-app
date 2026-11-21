@@ -40,6 +40,8 @@ type Group = {
   name: string;
   timezone: string;
   owner_id: string | null;
+  description?: string;
+  avatar_version?: number;
 };
 type WorkoutRow = {
   user_id: string;
@@ -859,7 +861,7 @@ workspace.post("/groups", async (c) => {
   await c.env.DB.batch([
     stmt(
       c,
-      "INSERT INTO training_groups VALUES(?,?,?,?)",
+      "INSERT INTO training_groups(id,owner_id,name,timezone) VALUES(?,?,?,?)",
       id,
       me(c),
       name,
@@ -2305,5 +2307,187 @@ workspace.get("/challenges", async (c) => {
         };
       }),
     ),
+  });
+});
+
+// My groups: profile, picture, and a weekly ranking weighted by body weight.
+const avatarTypes = ["image/jpeg", "image/png", "image/webp"];
+const maxAvatar = 2_000_000;
+const avatarKey = (id: string) => "group-avatar/" + id;
+async function ownedGroup(c: Ctx, id: string) {
+  const group = await membership(c, id);
+  if (!group) return reject(404, "Group unavailable.");
+  if (group.owner_id !== me(c))
+    return reject(403, "Only the group owner can change this.");
+  return group;
+}
+workspace.get("/groups/summary", async (c) => {
+  return c.json({
+    items: await all<{ group_id: string; members: number }>(
+      c,
+      `${members} SELECT m.group_id,count(*) AS members FROM members m
+      WHERE m.group_id IN (SELECT group_id FROM members WHERE user_id=?)
+      GROUP BY m.group_id`,
+      google(c),
+      me(c),
+    ),
+  });
+});
+workspace.post("/groups/profile", async (c) => {
+  const i = z
+    .object({
+      id: z.string().max(80),
+      name: z.string().trim().min(1).max(80),
+      description: z.string().trim().max(240),
+    })
+    .parse(await c.req.json());
+  await ownedGroup(c, i.id);
+  await stmt(
+    c,
+    "UPDATE training_groups SET name=?,description=? WHERE id=?",
+    i.name,
+    i.description,
+    i.id,
+  ).run();
+  return c.json({ ok: true });
+});
+workspace.post("/groups/avatar", async (c) => {
+  const bucket = c.env.MEDIA;
+  if (!bucket) return c.json({ error: "Media storage is unavailable." }, 503);
+  const id = z.string().max(80).parse(c.req.query("id"));
+  await ownedGroup(c, id);
+  const type = c.req.header("content-type") ?? "";
+  if (!avatarTypes.includes(type))
+    return reject(400, "Choose a JPEG, PNG, or WebP image.");
+  const declared = Number(c.req.header("content-length"));
+  if (!Number.isInteger(declared) || declared <= 0 || declared > maxAvatar)
+    return reject(400, "Choose an image up to 2 MB.");
+  const body = await c.req.arrayBuffer();
+  if (!body.byteLength || body.byteLength > maxAvatar)
+    return reject(400, "Choose an image up to 2 MB.");
+  await bucket.put(avatarKey(id), body, {
+    httpMetadata: { contentType: type },
+  });
+  const row = await first<{ avatar_version: number }>(
+    c,
+    "UPDATE training_groups SET avatar_version=avatar_version+1 WHERE id=? RETURNING avatar_version",
+    id,
+  );
+  return c.json({ version: row?.avatar_version ?? 1 });
+});
+workspace.get("/groups/avatar/:id", async (c) => {
+  const id = z.string().max(80).parse(c.req.param("id"));
+  if (!(await membership(c, id)) || !c.env.MEDIA)
+    return reject(404, "Picture unavailable.");
+  const object = await c.env.MEDIA.get(avatarKey(id));
+  if (!object) return reject(404, "Picture unavailable.");
+  return new Response(object.body, {
+    headers: {
+      "Content-Type": object.httpMetadata?.contentType ?? "image/jpeg",
+      "Cache-Control": "private, max-age=86400",
+      "X-Content-Type-Options": "nosniff",
+      "Content-Security-Policy": "default-src 'none'; sandbox",
+    },
+  });
+});
+workspace.get("/groups/overview", async (c) => {
+  const i = z
+    .object({ id: z.string().max(80), week: day.optional() })
+    .parse(c.req.query());
+  const group = await membership(c, i.id);
+  if (!group) return reject(404, "Group unavailable.");
+  const thisWeek = mondayAt(localDay(now(), group.timezone));
+  const start = i.week ? mondayAt(i.week) : thisWeek;
+  if (start > thisWeek) return reject(400, "Choose a current or past week.");
+  const end = plusDays(start, 6);
+  const people = await all<{
+    id: string;
+    name: string;
+    shared: number;
+    named: number | null;
+  }>(
+    c,
+    `${members} SELECT u.id,u.name,p.named,p.user_id IS NOT NULL AS shared
+    FROM members m JOIN users u ON u.id=m.user_id
+    LEFT JOIN metric_permissions p ON p.user_id=u.id AND p.scope='group' AND p.target_id=m.group_id
+    WHERE m.group_id=? ORDER BY u.name`,
+    google(c),
+    i.id,
+  );
+  const self = me(c);
+  // Others appear only when they chose to share named results with the group.
+  const listed = people.filter(
+    (person) => person.id === self || (person.shared && person.named),
+  );
+  const ranking = await Promise.all(
+    listed.map(async (person) => {
+      const summary = metrics(
+        await analysisEntries(c, person.id),
+        { start, end },
+        group.timezone,
+      );
+      const body = await first<{ kg: number }>(
+        c,
+        // The latest weigh-in on or before the week, else the first one after.
+        `SELECT kg FROM (SELECT day,value AS kg FROM measurements WHERE user_id=? AND kind='weight'
+          UNION ALL SELECT day,kg FROM weights WHERE user_id=?)
+          ORDER BY day<=? DESC, CASE WHEN day<=? THEN day END DESC, day ASC LIMIT 1`,
+        person.id,
+        person.id,
+        end,
+        end,
+      );
+      return {
+        id: person.id,
+        name: person.name,
+        isMe: person.id === self,
+        workouts: summary.sessions,
+        sets: summary.sets,
+        // Relative strength is weekly volume divided by body weight. Raw
+        // volume is returned only for yourself so body weight cannot be
+        // worked out from other people's results.
+        relative: body ? summary.volume / body.kg : null,
+        volumeKg: person.id === self ? summary.volume : null,
+      };
+    }),
+  );
+  const activity = await all<{
+    user_id: string;
+    name: string;
+    start_time: string;
+    title: string | null;
+  }>(
+    c,
+    `${members} SELECT u.id AS user_id,u.name,w.start_time,json_extract(w.data,'$.title') AS title
+    FROM workout_details d JOIN workouts w ON w.user_id=d.user_id AND w.source_id=d.workout_id
+    JOIN users u ON u.id=d.user_id
+    WHERE d.group_id=? AND d.audience='group' AND d.deleted=0
+    AND EXISTS(SELECT 1 FROM members m WHERE m.group_id=d.group_id AND m.user_id=d.user_id)
+    ORDER BY w.start_time DESC LIMIT 8`,
+    google(c),
+    i.id,
+  );
+  return c.json({
+    group: {
+      id: group.id,
+      name: group.name,
+      description: group.description ?? "",
+      owner_id: group.owner_id,
+      timezone: group.timezone,
+      avatar_version: group.avatar_version ?? 0,
+    },
+    isOwner: group.owner_id === self,
+    sharing: people.some((p) => p.id === self && p.shared),
+    week: { start, end, current: start === thisWeek },
+    ranking,
+    hidden: people.length - listed.length,
+    members: people.map((p) => ({
+      id: p.id,
+      name: p.name,
+      isMe: p.id === self,
+      isOwner: p.id === group.owner_id,
+      sharing: !!p.shared,
+    })),
+    activity,
   });
 });

@@ -13,6 +13,8 @@ export type TrainingGroup = {
   name: string;
   timezone: string;
   owner_id: string | null;
+  description?: string;
+  avatar_version?: number;
 };
 export type Person = { id: string; name: string };
 export type Permission = {

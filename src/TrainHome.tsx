@@ -490,10 +490,6 @@ export function AccountWorkspace({
   setDistanceUnit: (unit: string) => void;
 }) {
   const [prefs, setPrefs] = useState<TrainingPreferences>(home.settings),
-    [groupName, setGroupName] = useState(""),
-    [group, setGroup] = useState("");
-  const [email, setEmail] = useState(""),
-    [link, setLink] = useState(""),
     [error, setError] = useState(""),
     [notice, setNotice] = useState(""),
     [busy, setBusy] = useState(false);
@@ -604,111 +600,6 @@ export function AccountWorkspace({
           Save preferences
         </button>
       </form>
-      <section className="card workspace-form">
-        <h3>Private groups</h3>
-        <form
-          className="workspace-actions"
-          onSubmit={(e) => {
-            e.preventDefault();
-            void run(async () => {
-              await request("/groups", {
-                name: groupName,
-                timezone: prefs.timezone,
-              });
-              setGroupName("");
-            }, "Group created.");
-          }}
-        >
-          <label>
-            Group name
-            <input
-              required
-              maxLength={80}
-              value={groupName}
-              onChange={(e) => setGroupName(e.target.value)}
-            />
-          </label>
-          <button className="outline" disabled={busy}>
-            Create group
-          </button>
-        </form>
-        {home.groups.map((g) => (
-          <div className="workspace-list-row" key={g.id}>
-            <strong>{g.name}</strong>
-            <span className="muted">{g.timezone}</span>
-            {g.owner_id && g.owner_id !== owner && (
-              <button
-                className="text-button"
-                disabled={busy}
-                onClick={() => {
-                  if (window.confirm("Leave " + g.name + "?"))
-                    void run(
-                      () => request("/groups/leave", { id: g.id }),
-                      "Group left.",
-                    );
-                }}
-              >
-                Leave group
-              </button>
-            )}
-          </div>
-        ))}
-        {home.groups.some((g) => g.owner_id === owner) && (
-          <form
-            className="workspace-form"
-            onSubmit={(e) => {
-              e.preventDefault();
-              void run(async () => {
-                const result = await request<{ url: string }>(
-                  "/groups/invite",
-                  { groupId: group, email },
-                );
-                setLink(result.url);
-              }, "Invitation ready.");
-            }}
-          >
-            <label>
-              Group to invite to
-              <select
-                required
-                value={group}
-                onChange={(e) => setGroup(e.target.value)}
-              >
-                <option value="">Select group</option>
-                {home.groups
-                  .filter((g) => g.owner_id === owner)
-                  .map((g) => (
-                    <option key={g.id} value={g.id}>
-                      {g.name}
-                    </option>
-                  ))}
-              </select>
-            </label>
-            <label>
-              Google account email
-              <input
-                type="email"
-                required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-              />
-            </label>
-            <button className="outline" disabled={busy}>
-              Create group invitation
-            </button>
-            {link && (
-              <label>
-                Invitation URL
-                <input
-                  readOnly
-                  value={link}
-                  onFocus={(e) => e.target.select()}
-                />
-              </label>
-            )}
-          </form>
-        )}
-      </section>
       <section className="card workspace-form">
         <h3>Comparison sharing</h3>
         <p className="muted">

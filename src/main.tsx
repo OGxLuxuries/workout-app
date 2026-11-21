@@ -4,6 +4,7 @@ import { localDay, monday, addDays, rankPlayers } from "../shared/scoring";
 import { allTimeStart } from "../shared/sync";
 import { Activity, Icon, InstallCard } from "./workout-ui";
 import { CompetitionRuns, ImportRun, RunSplits } from "./ImportRun";
+import { MyGroups } from "./Groups";
 import {
   Session,
   changeDraftUnits,
@@ -110,6 +111,7 @@ const navigation = [
   { screen: "Overview", label: "Today", icon: "activity" },
   { screen: "Train", label: "Train", icon: "train" },
   { screen: "Workouts", label: "Progress", icon: "history" },
+  { screen: "Groups", label: "Groups", icon: "group" },
   { screen: "Compare", label: "Compare", icon: "compete" },
   { screen: "Settings", label: "You", icon: "profile" },
 ] as const;
@@ -117,6 +119,7 @@ const tabPaths: Record<string, string> = {
   Overview: "today",
   Train: "train",
   Workouts: "progress",
+  Groups: "groups",
   Compare: "compare",
   Competition: "standings",
   Settings: "you",
@@ -1124,6 +1127,17 @@ function App() {
                   setNotice("Run shared with your competition group.");
                   void refreshWorkspace();
                 }}
+              />
+            </PageSection>
+          )}
+          {accountId && (
+            <PageSection id={tabPaths.Groups} title="My groups">
+              <MyGroups
+                home={home}
+                owner={accountId}
+                unit={unit}
+                revision={revision}
+                refresh={() => void refreshWorkspace()}
               />
             </PageSection>
           )}

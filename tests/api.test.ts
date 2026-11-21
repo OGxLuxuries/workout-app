@@ -1082,6 +1082,124 @@ describe("account and sync flow with real local D1", () => {
     expect(signedIn.headers.get("Cache-Control")).toBe("private, no-store");
     expect(new Uint8Array(await signedIn.arrayBuffer())).toEqual(fixture);
   });
+  it("runs My groups: picture, invitations scope, and body-weight-weighted ranking", async () => {
+    const MEDIA = await mf.getR2Bucket("MEDIA");
+    const created = await call(
+      "/app/v2/groups",
+      { name: "Lifting crew", timezone: "America/New_York" },
+      a,
+    );
+    expect(created.status).toBe(200);
+    const id = created.body.id as string;
+    await DB.prepare("INSERT INTO training_group_members VALUES(?,?)")
+      .bind(id, bid)
+      .run();
+    const week = "2026-11-01";
+    const overview = (cookie: string) =>
+      call(`/app/v2/groups/overview?id=${id}&week=${week}`, undefined, cookie);
+    const fixture = sample("group-ranking");
+    await DB.prepare("INSERT INTO workouts VALUES(?,?,?,?,?)")
+      .bind(
+        aid,
+        fixture.id,
+        fixture.updated_at,
+        fixture.start_time,
+        JSON.stringify(fixture),
+      )
+      .run();
+    await DB.prepare("DELETE FROM weights WHERE user_id=? AND day=?")
+      .bind(aid, week)
+      .run();
+    await DB.prepare("INSERT INTO measurements VALUES(?,?,?,?)")
+      .bind(aid, week, "weight", 80)
+      .run();
+    // Relative strength is the week's volume divided by body weight.
+    const mine = (await overview(a)).body;
+    expect(mine.isOwner).toBe(true);
+    expect(mine.ranking).toHaveLength(1);
+    expect(mine.ranking[0].volumeKg).toBeGreaterThan(0);
+    expect(mine.ranking[0].relative).toBeCloseTo(mine.ranking[0].volumeKg / 80);
+    // Members stay hidden until they share named results with the group.
+    expect(mine.members).toHaveLength(2);
+    expect(mine.ranking).toHaveLength(1);
+    expect(mine.hidden).toBe(1);
+    await call(
+      "/app/v2/groups/consent",
+      { scope: "group", targetId: id, share: true, named: true },
+      b,
+    );
+    const shared = (await overview(a)).body;
+    expect(shared.ranking).toHaveLength(2);
+    expect(shared.hidden).toBe(0);
+    const peer = shared.ranking.find((x: { isMe: boolean }) => !x.isMe);
+    expect(peer.volumeKg).toBeNull();
+    // Only the owner can change the picture or profile; images only.
+    const avatar = (cookie: string, type: string, body: Uint8Array) =>
+      app.request(
+        `http://localhost:8787/api/app/v2/groups/avatar?id=${id}`,
+        {
+          method: "POST",
+          headers: {
+            Origin: env.APP_ORIGIN,
+            "X-Workout-Request": "1",
+            "Content-Type": type,
+            "Content-Length": String(body.byteLength),
+            Cookie: cookie,
+          },
+          body: body as unknown as BodyInit,
+        },
+        { ...env, DB, MEDIA },
+      );
+    const pixel = new Uint8Array([255, 216, 255, 217]);
+    expect((await avatar(b, "image/jpeg", pixel)).status).toBe(403);
+    expect((await avatar(a, "text/html", pixel)).status).toBe(400);
+    const uploaded = await avatar(a, "image/jpeg", pixel);
+    expect(uploaded.status).toBe(200);
+    expect(((await uploaded.json()) as { version: number }).version).toBe(1);
+    const served = await app.request(
+      `http://localhost:8787/api/app/v2/groups/avatar/${id}`,
+      { headers: { Cookie: b } },
+      { ...env, DB, MEDIA },
+    );
+    expect(served.status).toBe(200);
+    expect(served.headers.get("Content-Type")).toBe("image/jpeg");
+    expect(new Uint8Array(await served.arrayBuffer())).toEqual(pixel);
+    expect(
+      (
+        await call(
+          "/app/v2/groups/profile",
+          { id, name: "Hijack", description: "" },
+          b,
+        )
+      ).status,
+    ).toBe(403);
+    expect(
+      (
+        await call(
+          "/app/v2/groups/profile",
+          { id, name: "Iron crew", description: "Weekly weighted lifting" },
+          a,
+        )
+      ).status,
+    ).toBe(200);
+    expect((await overview(a)).body.group.name).toBe("Iron crew");
+    const list = (await call("/app/v2/groups/summary", undefined, a)).body;
+    expect(
+      list.items.find((x: { group_id: string }) => x.group_id === id).members,
+    ).toBe(2);
+    // Outsiders cannot see the group or its picture.
+    const outsider = (await call("/app/v2/home", undefined, tashi)).body;
+    expect(outsider.groups.map((g: { id: string }) => g.id)).not.toContain(id);
+    expect(
+      (await call(`/app/v2/groups/overview?id=${id}`, undefined, tashi)).status,
+    ).toBe(404);
+    await DB.prepare("DELETE FROM workouts WHERE source_id=?")
+      .bind("group-ranking")
+      .run();
+    await DB.prepare("DELETE FROM measurements WHERE user_id=? AND day=?")
+      .bind(aid, week)
+      .run();
+  });
   it("rejects cross-site mutations and expired sessions", async () => {
     const r = await app.request(
       "http://localhost:8787/api/app/invite",
